@@ -1,0 +1,466 @@
+#!/bin/bash
+# ssd-resume: run after plugging the external SSD back in. Safe any time; it only fixes what is wrong.
+#   ssd-resume              check and fix
+#   ssd-resume --check      report only, change nothing
+#   ssd-resume --step NAME [--volumes A,B]
+#                           one step, for the SSD Monitor app. Prints one tab-separated line per result;
+#                           exit 1 means the step failed.
+#     list      VOLUME name uuid path, one line per volume
+#     mounts    mount every volume that is not at its path (plain `diskutil mount`: no password). A volume
+#               mounted elsewhere is moved only if a plain unmount works; nothing is forced
+#     services  restart the simulator service, adb and Gradle/Kotlin daemons. With --volumes, only those
+#               tied to these volumes; without, all of them but only if the SSD was reconnected since
+#               the last `record`
+#     locks     remove stale git lock files under ~/Repo (only while no git command runs, and only
+#               locks older than the step)
+#     writable  check that ~/Repo takes a new file
+#     report    APP lines (apps to reopen) and JOB lines (programs running in SSD folders); WARN if the
+#               list may be incomplete, FAILED if lsof gave none
+#     record    remember this USB connection, so services are not restarted twice (a terminal run also
+#               clears the planned-unplug marker that ssd-off leaves; in step mode the app does that)
+# ssd-monitor-protocol: 1   (SSD Monitor runs only scripts that carry this line)
+# Docs: AGENTS.md in the SSD Monitor repo (section 8). This Mac's setup is at the top of ssd-volumes.sh.
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+. "$HERE/ssd-volumes.sh"
+CHECK=0; STEP=""; FOR=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --check) CHECK=1 ;;
+    --step|--volumes)
+      [ -n "${2:-}" ] || { echo "$1 needs a value" >&2; exit 2; }
+      if [ "$1" = --step ]; then STEP=$2; else FOR=$2; fi
+      shift ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+say() { printf '%s\n' "$*"; }
+tilde() { printf '%s' "${1/#$HOME/~}"; }
+# Scratch files (only the lock step has any) live in one folder, made when first needed, that goes away on
+# exit, also on Ctrl-C or a stop from SSD Monitor; so does the write check's test file.
+WORK=""
+PROBE=""
+make_work() { [ -n "$WORK" ] || WORK=$(mktemp -d); }
+on_exit() {
+  if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+  if [ -n "$PROBE" ]; then rm -f "$PROBE"; fi
+  return 0
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM HUP
+# Step mode: one tab-separated line per result for the app. Otherwise: a line for people.
+emit() {
+  local kind=$1; shift
+  if [ -n "$STEP" ]; then local IFS=$'\t'; printf '%s\t%s\n' "$kind" "$*"; return; fi
+  case $kind in
+    OK)        say "  ✓ $1 → $(tilde "$2")" ;;
+    MOUNTED)   say "  ✓ $1 → $(tilde "$2") (moved from $3)" ;;
+    WRONG)     say "  ! $1: $2 (should be $(tilde "$3"))" ;;
+    FAILED)    say "  ✗ $1: $2" ;;
+    RESTARTED) say "  ↻ $1" ;;
+    RUNNING)   say "  ! $1 running since before the reconnect" ;;
+    REMOVED)   say "  ✓ removed stale lock: $(tilde "$1")" ;;
+    STALE)     say "  ! stale lock: $(tilde "$1")" ;;
+    SKIPPED)   say "  - $1" ;;
+    APP)       say "Reopen: $1" ;;
+    JOB)       say "  $1 (pid $2) in $(tilde "$3")" ;;
+  esac
+}
+SIM_SERVICE=com.apple.CoreSimulator.CoreSimulatorService
+
+step_list() {
+  local entry name uuid path
+  for entry in "${SSD_VOLUMES[@]}"; do ssd_split "$entry"; emit VOLUME "$V_NAME" "$V_UUID" "$V_PATH"; done
+}
+
+# Every volume at its own path and writable. Returns 1 if any is not.
+step_mounts() {
+  local bad=0 entry name uuid want dev cur now
+  ssd_snapshot_mounts   # one read of the mount table; read again only after mounting something
+  for entry in "${SSD_VOLUMES[@]}"; do
+    ssd_split "$entry"; name=$V_NAME; uuid=$V_UUID; want=$V_PATH
+    ssd_dev "$uuid"; dev=$DEV
+    if [ -z "$dev" ]; then emit FAILED "$name" "volume not found on the SSD"; bad=$((bad+1)); continue; fi
+    ssd_snap_of "$dev"; cur=$SNAP_AT
+    if [ "$cur" = "$want" ]; then
+      if [ $SNAP_RO = 1 ]; then
+        emit FAILED "$name" "mounted read-only. Run First Aid on it in Disk Utility, then unplug and replug the SSD"; bad=$((bad+1))
+      else
+        emit OK "$name" "$want"
+      fi
+      continue
+    fi
+    if [ $CHECK = 1 ]; then emit WRONG "$name" "${cur:-not mounted}" "$want"; bad=$((bad+1)); continue; fi
+    # Mounted somewhere else: move it, but never by force. Programs using it there keep their files.
+    if [ -n "$cur" ] && ! diskutil unmount "$dev" >/dev/null 2>&1; then
+      emit FAILED "$name" "mounted at $cur and in use there, so it was left alone. Quit what uses it, then try again"
+      bad=$((bad+1)); continue
+    fi
+    # A plain mount follows /etc/fstab and needs no password. `-mountPoint` makes macOS ask for an
+    # admin password in a dialog (found 2026-11-22), so it is only a fallback in a terminal.
+    diskutil mount "$dev" >/dev/null 2>&1
+    ssd_snapshot_mounts; ssd_snap_of "$dev"; now=$SNAP_AT
+    if [ "$now" != "$want" ] && [ -z "$STEP" ] && [ -t 0 ]; then
+      [ -n "$now" ] && diskutil unmount "$dev" >/dev/null 2>&1
+      say "  … $name: /etc/fstab was not followed; macOS will ask for your password to mount it at its path"
+      diskutil mount nobrowse -mountPoint "$want" "$dev" >/dev/null 2>&1
+      ssd_snapshot_mounts; ssd_snap_of "$dev"; now=$SNAP_AT
+    fi
+    if [ "$now" = "$want" ] && [ $SNAP_RO = 1 ]; then
+      emit FAILED "$name" "mounted read-only. Run First Aid on it in Disk Utility, then unplug and replug the SSD"; bad=$((bad+1))
+    elif [ "$now" = "$want" ]; then emit MOUNTED "$name" "$want" "${cur:-not mounted}"
+    else emit FAILED "$name" "could not mount at $(tilde "$want") (now: ${now:-not mounted}). Check /etc/fstab has its line."; bad=$((bad+1)); fi
+  done
+  [ $bad = 0 ]
+}
+
+# Is a service tied to one of these volumes (the arguments)? Without --volumes every service counts, unless its
+# list is empty (none of its files are on the SSD).
+tied_to() { [ $# -gt 0 ] || return 1; [ -z "$FOR" ] && return 0; local v; for v in "$@"; do case ",$FOR," in *",$v,"*) return 0 ;; esac; done; return 1; }
+
+# This user's processes matching the pgrep arguments, one pid per line. Returns 0 found, 1 none, 2 when
+# pgrep itself failed (then nobody can say whether the service runs). Another account's processes are not
+# ours to stop (and could not be).
+own_pids() {
+  local out rc
+  out=$(pgrep -U "$UID" "$@"); rc=$?
+  [ $rc -le 1 ] || return 2
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return $rc
+}
+
+# SIGTERM these pids (ours) and wait up to 30 s until every one of them is gone (the simulator service took
+# about 10 s once, winding down its runtimes; 2026-11-22). Returns 1 if one is still there. (A new instance
+# that launchd starts meanwhile has a new pid and does not count.)
+stop_pids() {
+  local p i left
+  [ $# -gt 0 ] || return 0
+  kill -TERM "$@" 2>/dev/null
+  for i in $(seq 1 60); do
+    left=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && left=1; done
+    [ $left = 0 ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Stop one service so it starts fresh. $1 label, $2 what happens next, $3 command to run first (or ""),
+# then the pgrep arguments. Returns 1 if it could not be stopped or its state could not be read.
+restart_service() {
+  local label=$1 next=$2 first=$3 pids rc; shift 3
+  pids=$(own_pids "$@"); rc=$?
+  if [ $rc = 2 ]; then emit FAILED "$label" "could not list processes (pgrep failed)"; return 1; fi
+  [ -n "$pids" ] || return 0
+  if [ $CHECK = 1 ]; then emit RUNNING "$label"; return 0; fi
+  [ -n "$first" ] && eval "$first" >/dev/null 2>&1
+  if stop_pids $pids; then emit RESTARTED "$label $next"; return 0; fi
+  emit FAILED "$label" "still running 30 s after SIGTERM"; return 1
+}
+
+# Services started before the volumes went away hold dead files until they are restarted.
+# Returns 1 if a service could not be stopped.
+step_services() {
+  local bad=0
+  if tied_to ${SSD_SIM_VOLUMES[@]+"${SSD_SIM_VOLUMES[@]}"}; then
+    restart_service "simulator service" "(boot simulators again from Xcode/Simulator)" \
+      "xcrun simctl shutdown all" -x "$SIM_SERVICE" || bad=1
+  fi
+  if tied_to ${SSD_ADB_VOLUMES[@]+"${SSD_ADB_VOLUMES[@]}"}; then
+    restart_service "adb server" "stopped (starts again on the next adb command)" \
+      "\"\$HOME/Library/Android/sdk/platform-tools/adb\" kill-server" -x adb || bad=1
+  fi
+  if tied_to ${SSD_GRADLE_VOLUMES[@]+"${SSD_GRADLE_VOLUMES[@]}"}; then
+    restart_service "Gradle/Kotlin daemons" "stopped (start again on the next build)" \
+      "" -f 'GradleDaemon|KotlinCompileDaemon' || bad=1
+  fi
+  return $bad
+}
+
+# Lock files left by git commands the disconnect interrupted. A lock is stale only if it is older than this
+# step (a git command that starts during the scan keeps its new lock), no git command runs, and no process
+# has it open (apps using a git library hold their lock open while they work). Returns 1 if a lock could not
+# be removed.
+# Every repository under ~/Repo, at any depth (build and dependency folders skipped: 1.6 s for 159 repos,
+# 2026-11-22): its .git folder, or the folder a .git file points to (gitdir:).
+repo_git_dirs() {
+  local p t line
+  # (Also skipped: macOS's own folders at the volume's root, which are not readable.)
+  find "$SSD_REPO_ROOT" \( -name node_modules -o -name .build -o -name DerivedData -o -name Pods -o -name .gradle \
+      -o -name build -o -name target -o -name dist -o -name .venv -o -name venv -o -name __pycache__ \
+      -o -name .next -o -name .turbo -o -name .cache -o -name .Spotlight-V100 -o -name .fseventsd \
+      -o -name .Trashes -o -name .DocumentRevisions-V100 -o -name .TemporaryItems \) -prune \
+      -o -name .git -print -prune 2>>"$errs" |
+  while IFS= read -r p; do
+    # Real paths only (no "..", no symlinks), so one folder never shows up under two names. A .git folder
+    # found by find under the (real) root is real already; what a .git file points to is resolved.
+    t=""; line=""
+    if [ -d "$p" ]; then t=$p
+    elif [ -f "$p" ]; then
+      IFS= read -r line < "$p" || true
+      case $line in "gitdir: "*) t=${line#gitdir: } ;; *) continue ;; esac
+      case $t in /*) ;; *) t=${p%/.git}/$t ;; esac
+      t=$(cd "$t" 2>/dev/null && pwd -P) || continue
+    fi
+    [ -n "$t" ] || continue
+    printf '%s\n' "$t"
+    # A worktree's folder shares refs, packed-refs and more with the repo's common folder (a bare repo, say):
+    # that one too.
+    if [ -f "$t/commondir" ]; then
+      IFS= read -r line < "$t/commondir" || true
+      case $line in /*) p=$line ;; *) p=$t/$line ;; esac
+      (cd "$p" 2>/dev/null && pwd -P)
+    fi
+  done | sort -u
+}
+
+# The git folders of a repo's .git: itself, its linked worktrees (worktrees/*), and its submodules
+# (modules/..., at any nesting, found by their HEAD file). Object stores are not walked: only their top
+# level is listed while looking for HEAD files.
+git_dirs_of() {
+  local g=$1
+  printf '%s\n' "$g"
+  if [ -d "$g/worktrees" ]; then find "$g/worktrees" -mindepth 1 -maxdepth 1 -type d 2>>"$errs"; fi
+  if [ -d "$g/modules" ]; then
+    find "$g/modules" \( -path '*/objects/pack' -o -path '*/objects/info' -o -path '*/objects/??' \) -prune \
+      -o -type f -name HEAD -print 2>>"$errs" | sed 's|/HEAD$||'
+  fi
+}
+
+# Is a git command running? 0 yes, 1 no, 2 can't tell (pgrep failed): then nothing is deleted.
+git_running() {
+  pgrep -x git >/dev/null; local rc=$?
+  [ $rc = 0 ] && return 0; [ $rc = 1 ] && return 1
+  return 2
+}
+
+step_locks() {
+  local rc stamp errs locks lk held bad=0 i out err
+  git_running; rc=$?
+  if [ $rc = 0 ]; then emit SKIPPED "a git command is running; locks left alone"; return 0; fi
+  if [ $rc = 2 ]; then emit FAILED "git locks" "could not check for running git commands (pgrep failed)"; return 1; fi
+  # One cleanup at a time (the app's and a terminal run could overlap): a kernel lock (flock) on a file in
+  # ~/Local/ssd, held through file descriptor 9 until this run and everything it started have ended, however
+  # it ends (the kernel drops it, also after SIGKILL). If another run holds it, this step fails (try again
+  # when it is done), so a skipped cleanup never passes as done.
+  if [ $CHECK = 0 ]; then
+    mkdir -p "$SSD_STATE_DIR" && exec 9>>"$SSD_STATE_DIR/git-locks.lock" \
+      || { emit FAILED "git locks" "could not open $(tilde "$SSD_STATE_DIR")/git-locks.lock"; return 1; }
+    /usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1; exit 0'
+    case $? in
+      0) ;;
+      1) emit FAILED "git locks" "another run is cleaning git locks; try again when it is done"; return 1 ;;
+      *) emit FAILED "git locks" "could not take the cleanup lock (perl)"; return 1 ;;
+    esac
+  fi
+  make_work || { emit FAILED "git locks" "could not create a temp folder"; return 1; }
+  stamp=$WORK/stamp; errs=$WORK/find-errors
+  : > "$stamp" && : > "$errs" || { emit FAILED "git locks" "could not create a temp file"; return 1; }
+  sleep 1   # from here on, a lock git makes is at least a second newer than the stamp (dates are in seconds)
+  # Every git folder (repos, their linked worktrees, their submodules), and in each only git's own lock files:
+  # at its top level the root refs (git names them in capitals: HEAD, ORIG_HEAD, CHERRY_PICK_HEAD, AUTO_MERGE,
+  # MERGE_RR, BISECT_EXPECTED_REV, MERGE_AUTOSTASH, ...) and index, config, config.worktree, packed-refs,
+  # shallow; and any lock inside git's own subfolders (refs, logs for reflogs, info, sequencer, rebase-merge,
+  # rebase-apply, rr-cache, and the object store's info and pack folders for commit-graph and
+  # multi-pack-index). Not other *.lock files at the top (other tools keep their own there, such as
+  # a gh-stack.lock), and never the loose objects.
+  # A search that could not read everything fails the step: stale locks may be hiding where it could not look.
+  local g d sub candidates=() dirs=$WORK/git-dirs tops=() subs=()
+  # Each git folder once (a worktree's .git file points into a folder its main repo lists too).
+  { while IFS= read -r g; do git_dirs_of "$g"; done < <(repo_git_dirs); } | sort -u > "$dirs"
+  while IFS= read -r d; do
+    tops+=("$d")
+    for sub in refs logs info sequencer rebase-merge rebase-apply rr-cache objects/info objects/pack; do
+      if [ -d "$d/$sub" ]; then subs+=("$d/$sub"); fi
+    done
+  done < "$dirs"
+  # Two searches for all of them together (xargs splits a very long list), not a few per folder.
+  if [ ${#tops[@]} -gt 0 ]; then
+    while IFS= read -r lk; do candidates+=("$lk"); done < <(
+      printf '%s\0' "${tops[@]}" | xargs -0 -J % find -E % -maxdepth 1 -type f \( -regex '.*/[A-Z_]+\.lock' \
+        -o -name index.lock -o -name config.lock -o -name config.worktree.lock -o -name packed-refs.lock \
+        -o -name shallow.lock \) 2>>"$errs"
+      if [ ${#subs[@]} -gt 0 ]; then
+        printf '%s\0' "${subs[@]}" | xargs -0 -J % find % -type f -name '*.lock' 2>>"$errs"
+      fi)
+  fi
+  if [ -s "$errs" ]; then
+    emit FAILED "git locks" "could not search everything: $(head -1 "$errs")"; return 1
+  fi
+  [ ${#candidates[@]} = 0 ] && return 0
+  # Stale means older than the step. A file is known by its inode (all of ~/Repo is one volume), so the same
+  # lock is never handled twice, whatever path led to it.
+  local files=() inodes=() k ino seen=" "
+  for lk in "${candidates[@]}"; do
+    if [ -e "$lk" ] && [ ! "$lk" -nt "$stamp" ]; then
+      ino=$(stat -f %i "$lk" 2>/dev/null) || continue
+      case $seen in *" $ino "*) continue ;; esac
+      seen+="$ino "; files+=("$lk"); inodes+=("$ino")
+    fi
+  done
+  [ ${#files[@]} = 0 ] && return 0
+  git_running; rc=$?
+  if [ $rc = 0 ]; then emit SKIPPED "a git command started; locks left alone"; return 0; fi
+  if [ $rc = 2 ]; then emit FAILED "git locks" "could not check for running git commands (pgrep failed)"; return 1; fi
+  # Which of them a running program has open, matched by inode (not by path text, which can differ): as few
+  # lsof runs as the argument limit allows (xargs). lsof exits 1 both for "none open" and for errors (macOS's
+  # xargs passes that on as 1); only that with nothing on stderr means none open. Anything else: delete nothing.
+  err=$WORK/lsof-errors
+  out=$(printf '%s\0' "${files[@]}" | xargs -0 lsof -Fi -- 2>"$err"); rc=$?
+  if [ $rc -gt 1 ] || [ -s "$err" ]; then
+    emit FAILED "git locks" "could not check which locks are in use: $(head -1 "$err")"; return 1
+  fi
+  held=" $(printf '%s\n' "$out" | sed -n 's/^i//p' | tr '\n' ' ')"
+  # (The checks right before each delete below, stat and rm per lock, stay one by one on purpose: they make
+  # deleting safe. Stale locks are normally none to a few.)
+  [ -z "$STEP" ] && say "Git locks:"
+  for k in "${!files[@]}"; do
+    lk=${files[k]}
+    if case $held in *" ${inodes[k]} "*) true ;; *) false ;; esac; then
+      emit SKIPPED "$(tilde "$lk") is open in a running program; left alone"
+    elif [ $CHECK = 1 ]; then emit STALE "$lk"
+    # Right before deleting: still the same file, still older than this step. A lock git made since (after
+    # someone else removed the stale one) has a new inode and a newer date, and stays.
+    elif [ "$(stat -f %i "$lk" 2>/dev/null)" != "${inodes[k]}" ] || [ "$lk" -nt "$stamp" ]; then
+      emit SKIPPED "$(tilde "$lk") changed since the check; left alone"
+    elif rm -f "$lk"; then emit REMOVED "$lk"
+    else emit FAILED "$lk" "could not be removed"; bad=1; fi
+  done
+  return $bad
+}
+
+# ~/Repo takes a new file (a unique one, removed again).
+step_writable() {
+  if ! PROBE=$(mktemp "$SSD_REPO_ROOT/.ssd-resume-check.XXXXXX" 2>/dev/null); then
+    PROBE=""; emit FAILED "$(basename "$SSD_REPO_ROOT")" "$(tilde "$SSD_REPO_ROOT") is mounted but not writable"; return 1
+  fi
+  rm -f "$PROBE" || { emit FAILED "Repo" "could not remove the test file $(tilde "$PROBE")"; return 1; }
+  PROBE=""
+}
+
+# What is left for the user: apps to reopen, programs (not shells or agents) whose working folder is on the SSD.
+step_report() {
+  local apps=() a roots jobs
+  pgrep -x Xcode >/dev/null && apps+=("Xcode")
+  pgrep -x Simulator >/dev/null && apps+=("Simulator")
+  pgrep -f 'Android Studio.app/Contents/MacOS' >/dev/null && apps+=("Android Studio")
+  pgrep -f 'Visual Studio Code.app/Contents/MacOS' >/dev/null && apps+=("VS Code (Reload Window)")
+  pgrep -f qemu-system >/dev/null && apps+=("Android emulator")
+  if [ ${#apps[@]} -gt 0 ]; then
+    if [ -n "$STEP" ]; then for a in "${apps[@]}"; do emit APP "$a"; done; else say "Reopen: ${apps[*]}"; fi
+  fi
+  roots=$(for e in "${SSD_VOLUMES[@]}"; do printf '%s|' "${e##*|}"; done)
+  # lsof's listing streams through the filter (awk reads it all, so lsof finishes and its status is real; the
+  # last line counts what lsof gave). lsof exits 1 when it could not read some processes (the list may be
+  # incomplete); worse, or no list at all, fails the step: "nothing to restart" must not be claimed without one.
+  local out rc
+  # Shells, editors and agents only show errors until the SSD is back; short-lived commands (git, awk, sleep,
+  # ...) end by themselves. Neither belongs on the "may need a restart" list. Only commands that always end on
+  # their own are left out: not tail (tail -f), interpreters (a perl or python server), git-* helpers (git's
+  # fsmonitor daemon) or tee.
+  local quick='^(git|awk|sed|grep|egrep|rg|find|sleep|head|sort|uniq|wc|cut|tr|xargs|ls|stat|ps|pgrep|lsof|mktemp|rm|cp|mv|ln|mkdir|touch|date|diskutil|mount|ioreg)$'
+  out=$(lsof -nP +c0 -d cwd -Fpcn 2>/dev/null | awk -v roots="$roots" -v quick="$quick" '
+           BEGIN { n = split(roots, r, "|") }
+           /^p/ { pid = substr($0, 2) } /^c/ { cmd = substr($0, 2) }
+           /^n/ { path = substr($0, 2); for (i = 1; i <= n; i++) if (r[i] != "" && (path == r[i] || index(path, r[i] "/") == 1)) {
+                    if (cmd !~ /^-?(zsh|bash|sh|fish|login|tmux.*|claude|codex|nvim|vim|less|man|caffeinate)$/ && cmd !~ /^[0-9]+(\.[0-9]+)+$/ && cmd !~ quick) print cmd "\t" pid "\t" path; break } }
+           END { print "#lines\t" NR }'; exit "${PIPESTATUS[0]}"); rc=$?
+  case ${out##*$'\n'} in "#lines"$'\t'0|"") emit FAILED "report" "lsof could not list the running programs"; return 1 ;; esac
+  if [ $rc -gt 1 ]; then emit FAILED "report" "lsof could not list the running programs"; return 1; fi
+  if [ $rc = 1 ]; then
+    if [ -n "$STEP" ]; then emit WARN "lsof reported errors; the list may be incomplete"
+    else say "(lsof reported errors; the list below may be incomplete)"; fi
+  fi
+  jobs=""
+  case $out in *$'\n'*) jobs=$(printf '%s\n' "${out%$'\n'*}" | sort -u | head -15) ;; esac
+  if [ -n "$jobs" ]; then
+    [ -z "$STEP" ] && say "Running in SSD folders (restart them if they misbehave):"
+    printf '%s\n' "$jobs" | while IFS=$'\t' read -r c p d; do emit JOB "$c" "$p" "$d"; done
+  fi
+  return 0
+}
+
+# Remember this connection, so a second run does not restart services again.
+step_record() {
+  if ! { mkdir -p "$SSD_STATE_DIR" && printf '%s\n' "$(ssd_connection_id)" > "$SSD_STATE_DIR/last-connection"; }; then
+    emit FAILED "record" "could not write $(tilde "$SSD_STATE_DIR")/last-connection"; return 1
+  fi
+  # In a terminal run, the planned unplug is over. (SSD Monitor clears the marker itself, and only one
+  # older than its resume: an ssd-off started meanwhile keeps its marker.)
+  [ -z "$STEP" ] && rm -f "$SSD_STATE_DIR/planned-unplug"
+  return 0
+}
+
+reconnected() { [ "$(ssd_connection_id)" != "$(cat "$SSD_STATE_DIR/last-connection" 2>/dev/null)" ]; }
+
+# ---- one step for the SSD Monitor app
+if [ -n "$STEP" ]; then
+  case $STEP in
+    list) step_list ;;
+    mounts)
+      ssd_load_devices
+      [ -n "$(ssd_any_uuid)" ] || { emit FAILED "SSD" "not attached"; exit 1; }
+      step_mounts ;;
+    services)
+      if [ -z "$FOR" ] && ! reconnected; then emit SKIPPED "no reconnect since the last record"; exit 0; fi
+      step_services ;;
+    locks) step_locks ;;
+    writable) step_writable ;;
+    report) step_report ;;
+    record) step_record ;;
+    *) echo "unknown step: $STEP" >&2; exit 2 ;;
+  esac
+  exit $?
+fi
+
+# ---- the full run, for people
+# 1. Wait a little for the SSD to appear (it takes a few seconds after plugging in).
+for _ in $(seq 1 20); do ssd_load_devices; [ -n "$(ssd_any_uuid)" ] && break; sleep 1; done
+if [ -z "$(ssd_any_uuid)" ]; then
+  say "SSD not found. Plug it in (directly into the Mac, not a hub), wait a few seconds, run ssd-resume again."
+  exit 1
+fi
+
+# Any ✗ below makes the run fail (exit 1), and then the connection is not recorded as fixed.
+FAIL=0
+
+# 2. Every volume mounted at its own path.
+say "Volumes:"
+if ! step_mounts; then
+  if [ $CHECK = 0 ]; then
+    say ""; say "Some volumes are not in place. Unplug and replug the SSD, wait 10 seconds, run ssd-resume again."
+    exit 1
+  fi
+  FAIL=1
+fi
+if [ $CHECK = 0 ] && ! step_writable; then exit 1; fi
+
+# 3. Was the SSD reconnected since the last ssd-resume? Then services started earlier hold dead files.
+say ""
+if reconnected; then
+  say "The SSD was reconnected since the last ssd-resume."
+  # Did macOS have to repair the disk when it remounted?
+  fsck=$(/usr/bin/log show --last 30m --style compact --predicate 'process == "fsck_apfs"' 2>/dev/null | grep -ciE 'repair|corrupt|invalid|error')
+  [ "${fsck:-0}" -gt 0 ] && say "  ! macOS reported $fsck disk-check problem lines in the last 30 min: /usr/bin/log show --last 30m --predicate 'process == \"fsck_apfs\"'"
+  say "Services:"
+  step_services || FAIL=1
+  was_reconnected=1
+else
+  say "No reconnect since the last ssd-resume."
+  was_reconnected=0
+fi
+
+# 4. Lock files left by git commands the disconnect interrupted.
+step_locks || FAIL=1
+
+# 5. What is left for you.
+if [ $was_reconnected = 1 ] || [ $CHECK = 1 ]; then step_report || FAIL=1; fi
+say "Terminal shells re-enter their folder on your next command (zsh hook). Claude Code and Codex sessions need nothing."
+
+# 6. Remember this connection, once everything worked.
+if [ $CHECK = 0 ] && [ $FAIL = 0 ]; then step_record || FAIL=1; fi
+if [ $FAIL = 1 ]; then
+  say "Not everything is in order (see above). Fix that, then run ssd-resume again."
+  exit 1
+fi
+say "Done."
