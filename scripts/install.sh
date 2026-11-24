@@ -9,7 +9,7 @@ for f in ssd-resume ssd-off ssd-volumes.sh ssd.zsh; do
   [ -f "$SCRIPTS/$f" ] || { echo "missing $SCRIPTS/$f" >&2; exit 1; }
 done
 for f in ssd-resume ssd-off; do
-  grep -q 'ssd-monitor-protocol: 1' "$SCRIPTS/$f" || { echo "$SCRIPTS/$f is too old for this app" >&2; exit 1; }
+  grep -q 'ssd-monitor-protocol: 2' "$SCRIPTS/$f" || { echo "$SCRIPTS/$f is too old for this app" >&2; exit 1; }
 done
 
 scripts/build.sh

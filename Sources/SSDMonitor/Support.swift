@@ -16,11 +16,12 @@ enum Paths {
     /// Left by `ssd-off` (or the app's own eject) when the SSD goes away on purpose.
     static let plannedMarker = home + "/Local/ssd/planned-unplug"
 
-    /// The scripts carry "ssd-monitor-protocol: 1" in their header. Older ones don't know `--step` and would
-    /// run their whole routine instead, so the app checks the text before it runs anything.
+    /// The scripts carry "ssd-monitor-protocol: 2" in their header. Older ones don't know `--step` and would
+    /// run their whole routine instead, or (protocol 1) force-unmount without stopping services and flushing
+    /// first, so the app checks the text before it runs anything.
     static func speaksProtocol(_ path: String) -> Bool {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
-        return text.contains("ssd-monitor-protocol: 1")
+        return text.contains("ssd-monitor-protocol: 2")
     }
 
     static func tilde(_ path: String) -> String {

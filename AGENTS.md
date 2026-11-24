@@ -412,8 +412,18 @@ says why.
 
 **Unmount the rest** tries a plain unmount first. If something holds the SSD, or the unmount hangs, it shows:
 - diskutil's reason, which names the program that refused
-- your programs with files there: program, pid, and working folder or open file
+- a warning if Xcode, Simulator or Android Studio is open, since they may have unsaved work
+- your programs with files there, in groups:
+  - programs with files open (quit these first)
+  - macOS services (they usually let go by themselves)
+  - programs that only have their working folder there, such as shells and agents. They block a plain unmount,
+    but lose nothing when it is forced.
 - **Try again** and a destructive **Force unmount**
+
+**Force unmount** runs `ssd-off --step force`, the same unmount as a terminal `ssd-off`: it stops simulators,
+emulators, adb and the Gradle/Kotlin daemons, flushes pending writes, then force-unmounts every SSD volume. If the
+flush doesn't finish, nothing is unmounted and it says why. Its confirmation repeats the open-apps warning but
+doesn't block: the same button serves an emergency.
 
 Then it ejects the SSD, and shows "Safe to unplug" only once the mount table confirms nothing of the SSD is
 mounted.
@@ -497,7 +507,7 @@ Measured on the source Mac, healthy, over 60 s: **0.0% CPU, 0 wake-ups, 14 MB.**
   - macOS 14 or later
   - Apple silicon
   - a Swift 6 toolchain (Xcode or the Command Line Tools)
-  - the helper scripts in `~/Local/bin`, carrying the line `ssd-monitor-protocol: 1`. The app runs no older
+  - the helper scripts in `~/Local/bin`, carrying the line `ssd-monitor-protocol: 2`. The app runs no older
     scripts, which would run their whole routine instead.
 - `scripts/install.sh`:
   - checks the helpers
@@ -564,12 +574,15 @@ helpers/ssd-off --check            # report only: what would stop, what uses the
 ```
 
 **Other things that are the source Mac's, and may need editing:**
-- **Services** (`step_services` in `ssd-resume`, and the shutdown part of `ssd-off`): the iOS simulator service,
+- **Services** (`step_services` in `ssd-resume`, and `stop_and_flush` in `ssd-off`): the iOS simulator service,
   the adb server (at `~/Library/Android/sdk/platform-tools/adb`), and Gradle/Kotlin daemons. Add the Mac's own
-  long-running services whose files are on the SSD, following the same pattern: stop them, then each must be gone
-  within 30 s.
+  long-running services whose files are on the SSD to both, following each one's pattern:
+  - `ssd-resume` stops them, then each must be gone within 30 s, or the step fails
+  - `ssd-off` stops them on a best-effort basis: each command has a time limit (`within`), a failure doesn't stop
+    the run, and the forced unmount takes care of anything still holding files
 - **Apps to reopen** (`step_report` in `ssd-resume`): Xcode, Simulator, Android Studio, VS Code.
-- **Apps that make `ssd-off` refuse** (unsaved work): Xcode, Simulator, Android Studio.
+- **Apps that may hold unsaved work** (`open_apps` in `ssd-off`): Xcode, Simulator, Android Studio. A terminal
+  `ssd-off` refuses while one is open; the app warns before Force unmount.
 - **The bun cache line** in `ssd.zsh`: drop it if the Mac doesn't use bun, or point it at the code volume.
 
 **Test fix-mode changes on a scratch folder only:** `SSD_REPO_ROOT=/scratch/folder helpers/ssd-resume --step
@@ -613,17 +626,22 @@ that time, but don't repeat it.
 
 ### `ssd-off`
 
-`ssd-off --check` only reports. If Xcode, Simulator or Android Studio is open, `ssd-off` refuses, since they may
-have unsaved work. Otherwise it lists what has files open on the SSD and asks before stopping anything. Then it:
+`ssd-off` in a terminal does everything in one call; `ssd-off --check` only reports. If Xcode, Simulator or
+Android Studio is open, `ssd-off` refuses, since they may have unsaved work. Otherwise it lists what has files open
+on the SSD and asks before stopping anything. Then it:
 - **writes the planned-unplug marker** `~/Local/ssd/planned-unplug`, and stops if it can't, so SSD Monitor raises
   no alarm
   - if the run stops before the eject, it removes the marker again
   - after a successful eject, the marker gets an `ejected` line, which keeps it valid however long the SSD is
     away
-- shuts down simulators, emulators, adb and the Gradle/Kotlin daemons
-- flushes pending writes (`sync`; a forced unmount does not flush)
-- force-unmounts the whole container, because shells and agents keep their working folder there
-- ejects the disk
+- runs the same code as the app's Force unmount (the `force` step):
+  - shuts down simulators, emulators, adb and the Gradle/Kotlin daemons. Each command has a time limit, so a
+    service stuck on a missing volume can't hold up the unmount.
+  - flushes pending writes (`sync`; a forced unmount does not flush). If that doesn't finish within 60 s,
+    nothing is unmounted and the run stops.
+  - force-unmounts each SSD volume, then the SSD's whole container (which also covers any other volume on the
+    SSD), because shells and agents keep their working folder there
+- ejects the disk (the `eject` step)
 
 Agents and shells can stay open; they show errors until the SSD is back.
 

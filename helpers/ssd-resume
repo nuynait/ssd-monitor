@@ -18,7 +18,7 @@
 #               list may be incomplete, FAILED if lsof gave none
 #     record    remember this USB connection, so services are not restarted twice (a terminal run also
 #               clears the planned-unplug marker that ssd-off leaves; in step mode the app does that)
-# ssd-monitor-protocol: 1   (SSD Monitor runs only scripts that carry this line)
+# ssd-monitor-protocol: 2   (SSD Monitor runs only scripts that carry this line)
 # Docs: AGENTS.md in the SSD Monitor repo (section 8). This Mac's setup is at the top of ssd-volumes.sh.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P)

@@ -614,45 +614,75 @@ final class AppController: NSObject, NSApplicationDelegate {
         run(Paths.off, ["--step", "users"], timeout: 45) { [weak self] r in
             guard let self else { return }
             let users = AppController.userLines(r)
+            let apps = AppController.appsWarning(r.lines("APP").compactMap(\.first))
             let stillMounted = self.lastBusy.isEmpty
                 ? "Some volumes are still mounted." : "Still mounted: \(self.lastBusy.joined(separator: ", "))."
             var content = OverlayContent(
                 tone: planned ? .info : .alarm, title: "Can't unmount: the SSD is in use",
                 message: (note.map { $0 + " " } ?? "") + stillMounted
-                    + " Stop the programs below, then press Try again. Or force the unmount.")
+                    + " Quit the programs that have files open there, then press Force unmount. Shells and agents"
+                    + " that only have their working folder there lose nothing. If nothing is left, Try again unmounts normally.")
+            let head = self.lastBusyWhy + (apps.map { [$0] } ?? [])
             if r.timedOut {
-                content.details = self.lastBusyWhy + ["(lsof took longer than 45 seconds and was stopped; the list may be incomplete)"] + users
+                content.details = head + ["(lsof took longer than 45 seconds and was stopped; the list may be incomplete)"] + users
             } else if !r.ok {
                 let why = r.lines("FAILED").first?.joined(separator: " ") ?? "exit status \(r.status)"
-                content.details = self.lastBusyWhy + ["(could not list what uses the SSD: \(why))"]
+                content.details = head + ["(could not list what uses the SSD: \(why))"]
             } else if !r.lines("WARN").isEmpty {
-                content.details = self.lastBusyWhy + ["(lsof reported errors; the list may be incomplete)"] + users
+                content.details = head + ["(lsof reported errors; the list may be incomplete)"] + users
             } else {
-                content.details = self.lastBusyWhy
+                content.details = head
                     + (users.isEmpty ? ["(none of your programs has files open there. macOS services are not visible"
                                         + " to lsof without admin rights: diskutil's reason above names who refused)"] : users)
             }
             content.buttons = [
                 OverlayButton("Try again", .primary) { [weak self] in self?.unmountRest(planned: planned) },
-                OverlayButton("Force unmount…", .destructive) { [weak self] in self?.confirmForce(planned: planned, users: users) },
+                OverlayButton("Force unmount…", .destructive) { [weak self] in
+                    self?.confirmForce(planned: planned, users: users, apps: apps)
+                },
                 OverlayButton("Dismiss") { [weak self] in self?.cancelUnmount(planned: planned) },
             ]
             self.ask(content)
         }
     }
 
+    /// The users step's lines, grouped by what to do about them: open files first (quit those programs), then
+    /// macOS services, then programs that only have their working folder there (they lose nothing when forced).
+    /// A program with both an open file and its working folder there is listed once, with the open file (the
+    /// step lists open files before working folders, so its open-file line is never the one cut off).
     private static func userLines(_ r: JobResult) -> [String] {
-        r.lines("USER").map { f in
-            guard f.count >= 4 else { return f.joined(separator: " ") }
-            let what = f[2] == "cwd" ? "working folder" : f[2] == "system" ? "macOS service, usually lets go by itself:" : "open file"
-            return "\(f[0]) (pid \(f[1])): \(what) \(Paths.tilde(f[3]))"
+        let rows = r.lines("USER")
+        let withFiles = Set(rows.filter { $0.count >= 4 && $0[2] != "cwd" }.map { $0[1] })
+        var files: [String] = [], system: [String] = [], cwd: [String] = [], other: [String] = []
+        for f in rows {
+            guard f.count >= 4 else { other.append(f.joined(separator: " ")); continue }
+            let line = "  \(f[0]) (pid \(f[1])): \(Paths.tilde(f[3]))"
+            switch f[2] {
+            case "cwd": if !withFiles.contains(f[1]) { cwd.append(line) }
+            case "system": system.append(line)
+            default: files.append(line)
+            }
         }
+        var out: [String] = []
+        if !files.isEmpty { out += ["Files open (quit these first, or they lose those files):"] + files }
+        if !system.isEmpty { out += ["macOS services (they usually let go by themselves):"] + system }
+        if !cwd.isEmpty { out += ["Only their working folder (they block a normal unmount, but lose nothing when forced):"] + cwd }
+        return out + other
     }
 
-    private func confirmForce(planned: Bool, users: [String]) {
+    /// One line naming the open apps that may hold unsaved work (the users step's APP lines), or nil if none.
+    private static func appsWarning(_ apps: [String]) -> String? {
+        guard !apps.isEmpty else { return nil }
+        let names = apps.count == 1 ? apps[0] : apps.dropLast().joined(separator: ", ") + " and " + apps[apps.count - 1]
+        return "\(names) \(apps.count == 1 ? "is" : "are") open and may have unsaved work: save and quit \(apps.count == 1 ? "it" : "them") first."
+    }
+
+    private func confirmForce(planned: Bool, users: [String], apps: String?) {
         var content = OverlayContent(
             tone: .alarm, title: "Force unmount?",
-            message: "These programs lose the files they have open on the SSD, and unsaved work in them can be lost. "
+            message: (apps.map { $0 + " " } ?? "")
+                + "SSD Monitor first stops simulators, emulators, adb and Gradle, and flushes pending writes. "
+                + "Programs with files open on the SSD then lose them, and unsaved work in them can be lost. "
                 + "Shells and agents only show errors until the SSD is back.")
         content.details = users
         content.buttons = [
@@ -662,18 +692,21 @@ final class AppController: NSObject, NSApplicationDelegate {
         ask(content)
     }
 
+    /// ssd-off's force step, the same unmount as a terminal ssd-off: stop the dev services, flush, force-unmount.
     private func forceUnmount(planned: Bool) {
         working(OverlayContent(tone: .progress, title: "Forcing the unmount", progress: -1,
-                               progressLabel: "diskutil unmount force"))
+                               progressLabel: "stopping dev services, flushing, diskutil unmount force"))
         Log.write("force unmount")
-        run(Paths.off, ["--step", "force"], timeout: 90) { [weak self] r in
+        run(Paths.off, ["--step", "force"], timeout: 180) { [weak self] r in
             guard let self else { return }
+            for s in r.lines("STOPPED") { Log.write("force unmount: " + s.joined(separator: " ")) }
             self.unmountedByApp.formUnion(r.lines("UNMOUNTED").compactMap(\.first))
             if r.ok {
                 self.eject(planned: planned)
             } else {
                 self.unmountProblem(planned: planned, title: "Force unmount failed",
-                                    message: r.timedOut ? "diskutil did not finish within 90 seconds and was stopped." : "Some volumes are still mounted.",
+                                    message: r.timedOut ? "The force unmount did not finish within 180 seconds and was stopped."
+                                        : (r.lines("FAILED").first?.first ?? "Some volumes are still mounted."),
                                     details: r.lines("BUSY").map { "\($0.first ?? ""): \($0.dropFirst().joined(separator: " "))" },
                                     retry: { [weak self] in self?.forceUnmount(planned: planned) })
             }

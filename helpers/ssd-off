@@ -1,17 +1,21 @@
 #!/bin/bash
 # ssd-off: run before unplugging the external SSD on purpose.
-#   ssd-off           stop dev services, flush, unmount all SSD volumes, eject the SSD
+#   ssd-off           everything in one go: stop dev services, flush, unmount all SSD volumes, eject the SSD
 #   ssd-off --check   only show what is using the SSD, change nothing
 #   ssd-off -y        don't ask before unmounting
 #   ssd-off --step NAME   one step, for the SSD Monitor app. Prints one tab-separated line per result;
-#                         exit 1 means the step failed. Nothing is stopped for you in step mode.
+#                         exit 1 means the step failed. Only the force step stops anything.
 #     unmount   plain unmount of every mounted SSD volume: UNMOUNTED or BUSY lines
 #     users     USER cmd pid kind path: what has files open on the SSD (kind: cwd, file, or system for
-#               macOS services); FAILED if lsof gave no list, WARN if the list may be incomplete
-#     force     force-unmount every SSD volume still mounted (programs using them lose those files)
-#     eject     eject the SSD once nothing on it is mounted
+#               macOS services); APP name: an open app that may hold unsaved work (Xcode, Simulator,
+#               Android Studio); FAILED if lsof gave no list, WARN if the list may be incomplete
+#     force     the same unmount as the terminal run: stop simulators, emulators, adb and the Gradle/Kotlin
+#               daemons (STOPPED lines), flush pending writes (FAILED, and nothing unmounted, if that doesn't
+#               finish), then force-unmount every SSD volume and the SSD's container (UNMOUNTED or BUSY lines;
+#               programs using them lose those files)
+#     eject     eject the SSD once nothing on it is mounted: EJECTED or FAILED
 #     mark      leave the planned-unplug marker, so the app does not sound the alarm
-# ssd-monitor-protocol: 1   (SSD Monitor runs only scripts that carry this line)
+# ssd-monitor-protocol: 2   (SSD Monitor runs only scripts that carry this line)
 # Claude Code / Codex sessions and shells in ~/Repo can stay open: they show errors until the SSD
 # is back and ssd-resume has run. Make sure none of them is in the middle of writing files.
 set -u
@@ -34,9 +38,14 @@ MARKER=$SSD_STATE_DIR/planned-unplug
 mark_planned() { mkdir -p "$SSD_STATE_DIR" && date +%s > "$MARKER"; }
 
 # Once the marker is written (MARKED=1), an exit before the eject removes it again, also on Ctrl-C or a stop
-# from SSD Monitor: the SSD is not going away after all.
-MARKED=0
-on_exit() { if [ $MARKED = 1 ]; then rm -f "$MARKER"; fi; return 0; }
+# from SSD Monitor: the SSD is not going away after all. A command that `within` is waiting for is stopped too
+# (a background command ignores Ctrl-C).
+MARKED=0; WITHIN_PID=""
+on_exit() {
+  if [ -n "$WITHIN_PID" ]; then kill -KILL "$WITHIN_PID" 2>/dev/null; fi
+  if [ $MARKED = 1 ]; then rm -f "$MARKER"; fi
+  return 0
+}
 trap on_exit EXIT
 trap 'exit 130' INT TERM HUP
 
@@ -82,9 +91,10 @@ ssd_roots() {
 }
 
 # Files open on the SSD, one line per program and kind: cmd pid cwd|file|system example-path (at most 60).
-# Returns 1 if lsof gave no list at all, 2 if it reported errors (the list may be incomplete, e.g. on a
-# failing disk). lsof's listing streams through the filter (it is the whole Mac's open files); awk reads it all,
-# so lsof always finishes and its exit status is real.
+# Open files and macOS services come first, working folders last: a program whose working folder is listed has
+# its open-file line listed too, if it has one. Returns 1 if lsof gave no list at all, 2 if it reported errors
+# (the list may be incomplete, e.g. on a failing disk). lsof's listing streams through the filter (it is the
+# whole Mac's open files); awk reads it all, so lsof always finishes and its exit status is real.
 users_on_ssd() {
   local roots out rc
   roots=$(ssd_roots)
@@ -95,9 +105,12 @@ users_on_ssd() {
              if (cmd ~ /^(lsof|awk)$/) break
              # macOS services (Spotlight, fseventsd) are listed too, as "system": they usually let go by themselves.
              kind = (cmd ~ /^(mds.*|mdworker.*|fseventsd)$/ ? "system" : (fd == "cwd" ? "cwd" : "file")); key = pid SUBSEP kind
-             if (!(key in seen) && shown < 60) { seen[key] = 1; shown++; print cmd "\t" pid "\t" kind "\t" path }
+             if (!(key in seen)) { seen[key] = 1; row = cmd "\t" pid "\t" kind "\t" path
+                                   if (kind == "cwd") cwds[++nc] = row; else files[++nf] = row }
              break } }
-    END { print "#lines\t" NR }'; exit "${PIPESTATUS[0]}"); rc=$?
+    END { for (i = 1; i <= nf && shown < 60; i++) { print files[i]; shown++ }
+          for (i = 1; i <= nc && shown < 60; i++) { print cwds[i]; shown++ }
+          print "#lines\t" NR }'; exit "${PIPESTATUS[0]}"); rc=$?
   # The last line counts what lsof gave: nothing at all means no list.
   case ${out##*$'\n'} in "#lines"$'\t'0|"") return 1 ;; esac
   [ $rc -gt 1 ] && return 1
@@ -105,12 +118,128 @@ users_on_ssd() {
   [ $rc = 0 ] || return 2
 }
 
+# Open apps that can lose unsaved work if their files vanish, one name per line.
+open_apps() {
+  pgrep -x Xcode >/dev/null && echo "Xcode"
+  pgrep -x Simulator >/dev/null && echo "Simulator"
+  pgrep -f 'Android Studio.app/Contents/MacOS' >/dev/null && echo "Android Studio"
+  return 0
+}
+
+# Run a command for at most $1 seconds, its output going to file $2: a service stuck on a missing volume must not
+# hold up the unmount. Returns the command's status, or 124 if it was stopped. A command that can't even be
+# killed (stuck in the kernel on a dead disk) is left behind rather than waited for.
+within() {
+  local ticks=$(($1 * 10)) out=$2 pid rc; shift 2
+  "$@" >"$out" 2>/dev/null &
+  pid=$!; WITHIN_PID=$pid
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $ticks -le 0 ]; then kill -KILL "$pid" 2>/dev/null; disown "$pid" 2>/dev/null; WITHIN_PID=""; return 124; fi
+    sleep 0.1; ticks=$((ticks - 1))
+  done
+  wait "$pid"; rc=$?
+  WITHIN_PID=""
+  return $rc
+}
+
+# What was stopped, and why the run stops: STOPPED and FAILED lines for the app, plain lines for the terminal.
+stopped() { if [ -n "$STEP" ]; then emit STOPPED "$*"; else say "  ■ $*"; fi; }
+failed() { if [ -n "$STEP" ]; then emit FAILED "$*"; else say "$*"; fi; }
+
+# Stop the background dev services that keep files open on the SSD (the resume starts them again), then flush:
+# a forced unmount does not flush by itself. Returns 1, with nothing unmounted, if the flush doesn't finish.
+stop_and_flush() {
+  local adb=$HOME/Library/Android/sdk/platform-tools/adb list e
+  if pgrep -f CoreSimulatorService >/dev/null; then
+    within 20 /dev/null xcrun simctl shutdown all
+    killall -TERM com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null
+    stopped "simulators shut down"
+  fi
+  if pgrep -x adb >/dev/null || pgrep -f qemu-system >/dev/null; then
+    list=$(mktemp -t ssd-off 2>/dev/null) || list=/dev/null
+    within 10 "$list" "$adb" devices
+    for e in $(awk '/^emulator-/ {print $1}' "$list" 2>/dev/null); do within 10 /dev/null "$adb" -s "$e" emu kill; done
+    [ "$list" = /dev/null ] || rm -f "$list"
+    within 10 /dev/null "$adb" kill-server || pkill -x adb
+    stopped "emulators and adb stopped"
+  fi
+  if pgrep -f 'GradleDaemon|KotlinCompileDaemon' >/dev/null; then
+    pkill -f 'GradleDaemon|KotlinCompileDaemon'; stopped "Gradle/Kotlin daemons stopped"
+  fi
+  sleep 2
+  within 60 /dev/null sync && return 0
+  failed "Flushing pending writes did not finish within 60 seconds, so nothing was unmounted."
+  return 1
+}
+
+# Is something mounted at this path? (From the last mount-table snapshot.)
+path_mounted() {
+  local l
+  for l in ${SSD_MOUNT_LINES[@]+"${SSD_MOUNT_LINES[@]}"}; do
+    case $l in *" on $1 ("*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Force-unmount every SSD volume: each one in the setup, then the SSD's whole container, which also covers any
+# other volume on the SSD. The devices and the container are found once, before anything is unmounted. Then the
+# final mount table decides every setup volume's line (so the app knows which went away): UNMOUNTED if it was
+# mounted and no longer is, BUSY if it is still mounted anywhere; the unmount commands' messages only explain a
+# BUSY line. Returns 1 if anything stays mounted.
+force_unmount() {
+  local bad=0 first msg name why i devs=() was=()
+  find_ssd
+  ssd_snapshot_mounts
+  for i in "${!SSD_VOLUMES[@]}"; do
+    ssd_split "${SSD_VOLUMES[$i]}"; ssd_dev "$V_UUID"; devs[$i]=$DEV; was[$i]=0
+    if [ -n "$DEV" ]; then ssd_snap_of "$DEV" && was[$i]=1; else path_mounted "$V_PATH" && was[$i]=1; fi
+  done
+  first=$(unmount_each force)
+  if [ -n "$container" ] && ! msg=$(diskutil unmountDisk force "$container" 2>&1); then
+    emit BUSY "$container" "${msg##*$'\n'}"; bad=1
+  fi
+  ssd_snapshot_mounts
+  for i in "${!SSD_VOLUMES[@]}"; do
+    ssd_split "${SSD_VOLUMES[$i]}"; name=$V_NAME
+    if [ -n "${devs[$i]}" ] && ssd_snap_of "${devs[$i]}"; then
+      why=$(printf '%s\n' "$first" | awk -F'\t' -v n="$name" '$1 == "BUSY" && $2 == n { print $3; exit }')
+      emit BUSY "$name" "${why:-still mounted at $SNAP_AT}"; bad=1
+    elif [ -z "${devs[$i]}" ] && path_mounted "$V_PATH"; then
+      emit BUSY "$name" "$V_PATH is still mounted, but diskutil can't find the SSD"; bad=1
+    elif [ "${was[$i]}" = 1 ]; then
+      emit UNMOUNTED "$name"
+    fi
+  done
+  return $bad
+}
+
+# Eject the SSD once nothing of it is mounted: an EJECTED or FAILED line. Returns 1 if it failed. $1: the whole
+# disk, if already known (the terminal run found it before unmounting anything); otherwise it is looked up.
+eject_ssd() {
+  local target=${1:-} e msg
+  if [ -z "$target" ]; then
+    find_ssd
+    if [ -z "$dev" ]; then
+      # Not found: make sure that means "not attached", not "diskutil failed" with volumes still mounted.
+      # (One read of the mount table for all seven paths.)
+      ssd_snapshot_mounts
+      for e in "${SSD_VOLUMES[@]}"; do
+        path_mounted "${e##*|}" && { emit FAILED "${e##*|} is still mounted, but diskutil can't find the SSD"; return 1; }
+      done
+      emit EJECTED "not attached"; return 0
+    fi
+    target=$whole
+  fi
+  if msg=$(diskutil eject "$target" 2>&1); then emit EJECTED "$target"; else emit FAILED "${msg##*$'\n'}"; return 1; fi
+}
+
 # ---- one step for the SSD Monitor app
 if [ -n "$STEP" ]; then
   case $STEP in
     unmount) unmount_each "" ;;
-    force) unmount_each force ;;
+    force) stop_and_flush && force_unmount ;;
     users)
+      open_apps | while IFS= read -r a; do emit APP "$a"; done
       raw=$(users_on_ssd); rc=$?
       if [ $rc = 1 ]; then emit FAILED "lsof could not list the open files"; exit 1; fi
       [ $rc = 2 ] && emit WARN "lsof reported errors; the list may be incomplete"
@@ -118,37 +247,21 @@ if [ -n "$STEP" ]; then
         while IFS=$'\t' read -r c p k d; do emit USER "$c" "$p" "$k" "$d"; done <<< "$raw"
       fi
       exit 0 ;;
-    eject)
-      find_ssd
-      if [ -z "$dev" ]; then
-        # Not found: make sure that means "not attached", not "diskutil failed" with volumes still mounted.
-        # (One read of the mount table for all seven paths.)
-        ssd_snapshot_mounts
-        for e in "${SSD_VOLUMES[@]}"; do
-          p=${e##*|}
-          for l in ${SSD_MOUNT_LINES[@]+"${SSD_MOUNT_LINES[@]}"}; do
-            case $l in *" on $p ("*) emit FAILED "$p is still mounted, but diskutil can't find the SSD"; exit 1 ;; esac
-          done
-        done
-        emit EJECTED "not attached"; exit 0
-      fi
-      if msg=$(diskutil eject "$whole" 2>&1); then emit EJECTED "$whole"; else emit FAILED "${msg##*$'\n'}"; exit 1; fi ;;
+    eject) eject_ssd ;;
     mark) mark_planned ;;
     *) echo "unknown step: $STEP" >&2; exit 2 ;;
   esac
   exit $?
 fi
 
+# ---- the terminal run: every step in one go
 find_ssd
 [ -z "$dev" ] && { say "SSD is not attached. Nothing to do."; exit 0; }
 
-# GUI apps can lose unsaved work if their files vanish: they must be quit by hand.
-apps=()
-pgrep -x Xcode >/dev/null && apps+=("Xcode")
-pgrep -x Simulator >/dev/null && apps+=("Simulator")
-pgrep -f 'Android Studio.app/Contents/MacOS' >/dev/null && apps+=("Android Studio")
-if [ ${#apps[@]} -gt 0 ]; then
-  say "Quit first: ${apps[*]}"
+# Apps that can lose unsaved work must be quit by hand.
+apps=$(open_apps)
+if [ -n "$apps" ]; then
+  say "Quit first: $(printf '%s\n' "$apps" | paste -sd ',' - | sed 's/,/, /g')"
   [ $CHECK = 1 ] || exit 1
 fi
 
@@ -169,31 +282,21 @@ fi
 mark_planned || { say "Could not write $MARKER. Nothing was stopped or unmounted."; exit 1; }
 MARKED=1   # interrupted or failed before the eject: the exit handler removes the marker again
 
-# Stop the background dev services that keep files open on the SSD.
-if pgrep -f CoreSimulatorService >/dev/null; then
-  xcrun simctl shutdown all >/dev/null 2>&1; killall -TERM com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null
-  say "  ■ simulators shut down"
+# The same steps the app runs: stop dev services and flush, force-unmount (shells and agents keep a working
+# folder there), eject. A failure leaves the marker to the exit handler, so SSD Monitor alarms about what is left.
+stop_and_flush || { say "Do not unplug yet. Run ssd-off again."; exit 1; }
+if ! out=$(force_unmount); then
+  say "Could not unmount:"
+  printf '%s\n' "$out" | awk -F'\t' '$1 == "BUSY" { print "  " $2 ": " $3 }'
+  say "Do not unplug yet. Run ssd-off again, or check 'diskutil list $whole'."; exit 1
 fi
-ADB=$HOME/Library/Android/sdk/platform-tools/adb
-if pgrep -x adb >/dev/null || pgrep -f qemu-system >/dev/null; then
-  for e in $("$ADB" devices 2>/dev/null | awk '/^emulator-/ {print $1}'); do "$ADB" -s "$e" emu kill >/dev/null 2>&1; done
-  "$ADB" kill-server >/dev/null 2>&1 || pkill -x adb
-  say "  ■ emulators and adb stopped"
+if ! out=$(eject_ssd "$whole"); then
+  say "Eject failed: $(printf '%s\n' "$out" | awk -F'\t' '$1 == "FAILED" { print $2; exit }')"
+  say "Do not unplug yet. Run ssd-off again, or check 'diskutil list $whole'."; exit 1
 fi
-if pgrep -f 'GradleDaemon|KotlinCompileDaemon' >/dev/null; then
-  pkill -f 'GradleDaemon|KotlinCompileDaemon'; say "  ■ Gradle/Kotlin daemons stopped"
-fi
-sleep 2; sync
-
-# Unmount every volume in the SSD's container (forced: shells and agents keep a working folder there), then eject.
-if diskutil unmountDisk force "$container" >/dev/null 2>&1 && diskutil eject "$whole" >/dev/null 2>&1; then
-  MARKED=0   # going away on purpose: the marker stays for SSD Monitor
-  # "ejected" confirms the unplug happened: SSD Monitor then honours the marker however old it is (e.g. after a
-  # restart while the SSD is away). A marker without it counts for 10 minutes only (an ssd-off killed halfway).
-  printf 'ejected\n' >> "$MARKER"
-  say "Safe to unplug the SSD."
-  say "Sessions and shells in SSD folders will show errors until you plug it back in and run ssd-resume."
-else
-  # Not going away after all: the exit trap removes the marker, so SSD Monitor alarms about what is left unmounted.
-  say "Unmount or eject failed. Check 'diskutil list $whole' and try again; do not unplug yet."; exit 1
-fi
+MARKED=0   # going away on purpose: the marker stays for SSD Monitor
+# "ejected" confirms the unplug happened: SSD Monitor then honours the marker however old it is (e.g. after a
+# restart while the SSD is away). A marker without it counts for 10 minutes only (an ssd-off killed halfway).
+printf 'ejected\n' >> "$MARKER"
+say "Safe to unplug the SSD."
+say "Sessions and shells in SSD folders will show errors until you plug it back in and run ssd-resume."
