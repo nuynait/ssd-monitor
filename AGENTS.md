@@ -386,13 +386,30 @@ helper scripts (section 8).
 | State | Menu bar | On screen |
 |---|---|---|
 | Healthy: every volume mounted at its path, writable | drive icon | nothing |
-| A problem that lasts 3 s (volume missing, at the wrong path, read-only, or the SSD gone) | red drive, also after Dismiss | Full-screen overlay on the main display, above every window. The alarm sound plays 3 times. Buttons: **Remount** (only when a volume is unmounted or at the wrong path), **Unmount the rest**, **Dismiss**. When the whole SSD is gone ("SSD disconnected"), only **Dismiss**: the resume starts by itself when it is back. |
-| SSD away on purpose (`ssd-off`, or the menu's eject) | busy drive while the unmount and eject commands run; a drive with a minus while volumes are unmounted but the SSD is still attached; red drive once it is unplugged | nothing |
+| A problem that lasts 3 s (volume missing, at the wrong path, read-only, or the SSD gone) | red drive, also after Dismiss | Full-screen overlay on the main display, above every window. The alarm sound plays 3 times. Buttons: **Remount** (only when a volume is unmounted or at the wrong path), **Unmount the rest**, then **Dismiss**, or, while "Require the SSD" is on (the default), the snooze choices instead. When the whole SSD is gone ("SSD disconnected"), no Remount or Unmount: the resume starts by itself when it is back. |
+| SSD away on purpose (`ssd-off`, or the menu's eject) | busy drive while the unmount and eject commands run; a drive with a minus while volumes are unmounted but the SSD is still attached; red drive once it is unplugged | With "Require the SSD" on: whatever isn't in place gets its screen after the usual 3 s, silent, with the snooze choices ("SSD not connected" once the SSD is away). Otherwise nothing. The app's own eject ends on "Safe to unplug", which then carries the snooze choices itself (and switches between those and OK if the mode changes while it is up). |
 | SSD back, or a problem fixed | busy drive | **Resume** with a progress bar. Can't be dismissed; it ends within each step's time limit. |
 | Resume finished | drive icon | Green check, and what is left to do (apps to reopen, jobs to restart). Click to dismiss. A new problem replaces it. |
 
 The red icon has one exception: during the first 20 s after the app starts, while macOS may still be attaching
 the SSD at login, an unplugged SSD shows as "waiting".
+
+**Require the SSD** (on by default) is for a Mac that can't be used without the SSD, so an eject followed by a
+forgotten replug doesn't go unnoticed. While it is on, whenever the SSD isn't fully in place (an accident, an
+eject, or one volume unmounted), its screen stays up until the SSD is back or the user snoozes the mode:
+- It is the alarm's own screen, with the same rules: on the main display, above every window (it doesn't block
+  the Mac), the sound only for a problem that isn't planned, after the same 3 s and grace periods (20 s at login,
+  10 s after a wake).
+- **Dismiss** is replaced by a snooze row: 10 min, 30 min, 1 hour, 1 day, Forever. A snooze dismisses the screen
+  the way Dismiss does.
+- A problem dismissed some other way (Dismiss on a stopped resume or a failed unmount) comes back as this
+  screen, silently.
+- When a snooze runs out, the mode is on again without a word. If the SSD is still missing then, its screen
+  comes up. The timer for that exists only while the SSD isn't fully in place (wall-clock, so time asleep
+  counts); while healthy there is none, and the setting is simply read when needed. Forever means off until
+  turned on from the menu.
+- The setting is kept across restarts (`requireSSDSnoozedUntil` in the app's defaults: absent = on, a date =
+  snoozed until then, the distant future = off).
 
 **The menu** lists, in order:
 - the SSD's free space (green, yellow under 200 GB, red under 100 GB)
@@ -400,6 +417,8 @@ the SSD at login, an unplugged SSD shows as "waiting".
 - show the alert
 - run resume now
 - safely eject
+- Require the SSD: on, snoozed (until when), or off; its submenu turns it on or snoozes it. A snooze from the
+  menu also closes the screen the mode kept up.
 - the alarm sound (any macOS alert sound, or none)
 - launch at login
 - the log
@@ -428,8 +447,8 @@ doesn't block: the same button serves an emergency.
 Then it ejects the SSD, and shows "Safe to unplug" only once the mount table confirms nothing of the SSD is
 mounted.
 
-**Dismiss** silences this problem. The alarm comes back only if it gets worse (another volume, or the SSD gone).
-When the volumes are back, the resume still runs.
+**Dismiss** (only while "Require the SSD" is snoozed or off) silences this problem. The alarm comes back only if
+it gets worse (another volume, or the SSD gone). When the volumes are back, the resume still runs.
 
 **Resume** runs six steps:
 1. Wait for the volumes. macOS mounts them from fstab; after 30 s the app mounts any still missing.
@@ -461,7 +480,7 @@ once they are back.
 - The marker counts while it is less than 10 minutes old. With an `ejected` line (written after a successful
   eject), it counts for as long as the SSD stays away.
 - If the SSD goes away in that time, or is already away when the app starts, the unplug is confirmed: no alarm
-  until the SSD is back.
+  until the SSD is back. With "Require the SSD" on, its silent "SSD not connected" screen comes up instead.
 - An older marker is a leftover and is ignored.
 - While `ssd-off` gets ready to unplug, no resume starts, and a running one stops. If `ssd-off` stops halfway, the
   resume runs then.

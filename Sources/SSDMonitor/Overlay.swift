@@ -23,6 +23,9 @@ struct OverlayContent {
     var progress: Double? = nil
     var progressLabel: String = ""
     var buttons: [OverlayButton] = []
+    /// A second, smaller row of buttons under its own label ("Require the SSD"'s snooze choices).
+    var snoozeLabel: String = ""
+    var snoozeButtons: [OverlayButton] = []
     /// Set for screens that a click anywhere dismisses (success, info).
     var onClick: (() -> Void)? = nil
 }
@@ -187,29 +190,22 @@ final class Overlay {
             let row = NSStackView()
             row.orientation = .horizontal
             row.spacing = 12
-            for spec in content.buttons {
-                let target = ButtonTarget(spec.action)
-                targets.append(target)
-                // The main choice and a destructive one are drawn in their own color: the overlay is never the
-                // active window, and AppKit draws a tinted bezel gray in a window that isn't.
-                let button: NSButton
-                switch spec.style {
-                case .primary:
-                    button = FilledButton(title: spec.title, fill: .controlAccentColor, target: target,
-                                          action: #selector(ButtonTarget.fire))
-                    button.keyEquivalent = "\r"
-                case .destructive:
-                    button = FilledButton(title: spec.title, fill: .systemRed, target: target,
-                                          action: #selector(ButtonTarget.fire))
-                    button.hasDestructiveAction = true
-                case .normal:
-                    button = FirstClickButton(title: spec.title, target: target, action: #selector(ButtonTarget.fire))
-                    button.bezelStyle = .push
-                    button.controlSize = .large
-                }
-                row.addArrangedSubview(button)
-            }
+            for spec in content.buttons { row.addArrangedSubview(makeButton(spec, size: .large)) }
             stack.setCustomSpacing(22, after: stack.arrangedSubviews.last ?? stack)
+            stack.addArrangedSubview(row)
+        }
+
+        if !content.snoozeButtons.isEmpty {
+            let label = NSTextField(labelWithString: content.snoozeLabel)
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            stack.setCustomSpacing(22, after: stack.arrangedSubviews.last ?? stack)
+            stack.addArrangedSubview(label)
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.spacing = 8
+            for spec in content.snoozeButtons { row.addArrangedSubview(makeButton(spec, size: .regular)) }
+            stack.setCustomSpacing(8, after: label)
             stack.addArrangedSubview(row)
         }
 
@@ -225,6 +221,29 @@ final class Overlay {
             card.centerYAnchor.constraint(equalTo: backdrop.centerYAnchor),
         ])
         return backdrop
+    }
+
+    /// The main choice and a destructive one are drawn in their own color: the overlay is never the active
+    /// window, and AppKit draws a tinted bezel gray in a window that isn't.
+    private func makeButton(_ spec: OverlayButton, size: NSControl.ControlSize) -> NSButton {
+        let target = ButtonTarget(spec.action)
+        targets.append(target)
+        let button: NSButton
+        switch spec.style {
+        case .primary:
+            button = FilledButton(title: spec.title, fill: .controlAccentColor, target: target,
+                                  action: #selector(ButtonTarget.fire))
+            button.keyEquivalent = "\r"
+        case .destructive:
+            button = FilledButton(title: spec.title, fill: .systemRed, target: target,
+                                  action: #selector(ButtonTarget.fire))
+            button.hasDestructiveAction = true
+        case .normal:
+            button = FirstClickButton(title: spec.title, target: target, action: #selector(ButtonTarget.fire))
+            button.bezelStyle = .push
+            button.controlSize = size
+        }
+        return button
     }
 
     private static func wrapping(_ text: String, font: NSFont, align: NSTextAlignment) -> NSTextField {

@@ -4,7 +4,20 @@ import ServiceManagement
 enum Preferences {
     private static let soundKey = "alertSound"
     private static let loginSetUpKey = "loginItemSetUp"
+    private static let requireKey = "requireSSDSnoozedUntil"
     static let defaultSound = "Sosumi"
+
+    /// "Require the SSD" (on by default): nil = on; a date = snoozed until then, `.distantFuture` = off until
+    /// turned back on. Kept across restarts; a snooze that has run out counts as on.
+    static var requireSnoozedUntil: Date? {
+        get { UserDefaults.standard.object(forKey: requireKey) as? Date }
+        set {
+            if let newValue { UserDefaults.standard.set(newValue, forKey: requireKey) }
+            else { UserDefaults.standard.removeObject(forKey: requireKey) }
+        }
+    }
+
+    static var requireSSD: Bool { requireSnoozedUntil.map { $0 <= Date() } ?? true }
 
     /// The alarm sound's name, or nil for no sound.
     static var alertSound: String? {

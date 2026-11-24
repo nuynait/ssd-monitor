@@ -115,6 +115,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(action("Safely eject the SSD…", #selector(eject), enabled: controller.canEject))
         menu.addItem(.separator())
 
+        menu.addItem(requireItem())
+
         let soundItem = NSMenuItem(title: "Alert sound", action: nil, keyEquivalent: "")
         soundItem.submenu = sounds   // filled when it opens
         menu.addItem(soundItem)
@@ -128,6 +130,36 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(action("Open log", #selector(openLog)))
         menu.addItem(.separator())
         menu.addItem(action("Quit SSD Monitor", #selector(quit)))
+    }
+
+    /// "Require the SSD", with its state in the title and the choices in a small submenu (made with the menu,
+    /// freed with it).
+    private func requireItem() -> NSMenuItem {
+        let until = Preferences.requireSnoozedUntil.flatMap { $0 > Date() ? $0 : nil }
+        let title: String
+        switch until {
+        case nil: title = "Require the SSD"
+        case .distantFuture?: title = "Require the SSD: off"
+        case let date?:
+            let day = Calendar.current.isDateInToday(date) ? Date.FormatStyle.DateStyle.omitted : .abbreviated
+            title = "Require the SSD: snoozed until \(date.formatted(date: day, time: .shortened))"
+        }
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.state = until == nil ? .on : .off
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let on = action("On", #selector(requireOn))
+        on.state = until == nil ? .on : .off
+        sub.addItem(on)
+        sub.addItem(.separator())
+        for choice in AppController.snoozeChoices {
+            let entry = action(choice.long, #selector(requireSnooze(_:)))
+            entry.representedObject = choice.seconds.map { NSNumber(value: $0) }
+            if choice.seconds == nil { entry.state = until == .distantFuture ? .on : .off }
+            sub.addItem(entry)
+        }
+        item.submenu = sub
+        return item
     }
 
     /// The alert sounds: None, then every macOS alert sound (system and the user's own).
@@ -171,6 +203,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func testSound() { controller.testSound() }
     @objc private func openLog() { NSWorkspace.shared.open(Log.url) }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func requireOn() { controller.turnRequireOn() }
+
+    @objc private func requireSnooze(_ sender: NSMenuItem) {
+        controller.snoozeFromMenu(for: (sender.representedObject as? NSNumber)?.doubleValue)
+    }
 
     @objc private func pickSound(_ sender: NSMenuItem) {
         let name = sender.representedObject as? String ?? ""

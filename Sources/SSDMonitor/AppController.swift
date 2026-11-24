@@ -8,6 +8,8 @@ func onMain(after delay: TimeInterval, _ body: @escaping @MainActor () -> Void) 
 /// Decides what the SSD's state means and what to show:
 /// - healthy: nothing on screen.
 /// - a problem that lasts 3 s: the alarm overlay and sound, unless the SSD is going away on purpose.
+/// - "Require the SSD" (on by default): no Dismiss; the screen stays until the SSD is back or the user snoozes
+///   the mode, and also comes up (silently) once the SSD is away on purpose.
 /// - the SSD back after an unplug (or a problem fixed in place): the resume, with its progress overlay.
 /// Everything is driven by disk events. While the SSD is healthy there is no timer at all.
 @MainActor
@@ -59,6 +61,18 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var unmountedByApp = Set<String>()   // what this eject flow unmounted, even if back by now
     private var markerWatch: DispatchSourceFileSystemObject?
     private var termSignal: DispatchSourceSignal?
+    private var snoozeTimer: DispatchSourceTimer?    // see updateSnoozeTimer
+    private var snoozeTimerFor: Date?                // the snooze end it is set for
+    private var askingIsSafeToUnplug = false         // the asking screen is the eject's "Safe to unplug"
+    private var safeToUnplugRequires = false         // and it was built while "Require the SSD" was on
+
+    /// "Require the SSD"'s snooze choices: the overlay's short label, the menu's, and the length (nil = off
+    /// until turned back on).
+    static let snoozeChoices: [(short: String, long: String, seconds: TimeInterval?)] = [
+        ("10 min", "Snooze 10 minutes", 600), ("30 min", "Snooze 30 minutes", 1800),
+        ("1 hour", "Snooze 1 hour", 3600), ("1 day", "Snooze 1 day", 86400),
+        ("Forever", "Off until turned back on", nil),
+    ]
 
     /// Seconds since boot, not counting sleep: a clock that can't be set back, for debounce and grace periods.
     private static var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
@@ -245,7 +259,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func evaluate() {
         guard let watcher, configError == nil else { statusMenu?.refresh(); return }
         let h = currentHealth()
-        defer { statusMenu?.refresh() }
+        defer { updateSnoozeTimer(); statusMenu?.refresh() }
 
         // Remember that the SSD was gone, whatever is on screen: its return starts the resume. The watcher
         // latches a disconnect that is already over by now. (At login the SSD may simply not be attached
@@ -349,18 +363,43 @@ final class AppController: NSObject, NSApplicationDelegate {
         if !h.connected, let next = graceEnds.filter({ $0 > now }).min() { checkAgain(after: next - now) }
 
         if isPlanned(h) {
-            if phase == .alarm { sound.stop(); overlay.close(); phase = .idle }
             // Whatever goes unmounted on the way is owed a resume, in case the unplug stops halfway. (If the SSD
             // goes away, its return runs a full one anyway.)
             if h.connected { alarmed.formUnion(h.bad.map(\.volume.name)) }
+            // The eject's "Safe to unplug" follows the mode: with the snooze row while it is on, OK while it isn't.
+            if phase == .asking, askingIsSafeToUnplug, safeToUnplugRequires != requireActive { showSafeToUnplug() }
+            guard requireActive, phase != .asking else {
+                problemSince = nil
+                if phase == .alarm { sound.stop(); overlay.close(); phase = .idle }
+                return
+            }
+            // "Require the SSD": planned or not, whatever isn't in place gets its screen, silent (on purpose), until
+            // the SSD is back or the user snoozes it. Like any problem it first comes up after the grace periods
+            // (login, wake) and 3 s; one already up stays. Not over a screen waiting for the user (the eject's
+            // "Safe to unplug" offers the snooze itself).
+            if phase == .alarm { sound.stop(); problemSince = nil; showAlarm(sound: false); return }
+            let graceEnd = max(graceUntil, seenConnected ? 0 : launchedAt + AppController.startupGrace)
+            if now < graceEnd { problemSince = nil; checkAgain(after: graceEnd - now); return }
+            guard let since = problemSince else {
+                problemSince = now
+                checkAgain(after: AppController.debounce)
+                return
+            }
+            guard now - since >= AppController.debounce else {
+                checkAgain(after: AppController.debounce - (now - since))
+                return
+            }
             problemSince = nil
+            showAlarm(sound: false)
             return
         }
         let bad = Set(h.bad.map(\.volume.name))
         // Quiet: a dismissed problem (unless it gets worse), or one that was already there when a screen waiting
         // for the user came up (that screen stays). No alarm for it, but it is still timed once, silently, so its
-        // volumes get the resume when they are back; after that the app stays idle.
-        let quiet = (phase == .idle && dismissed.map { bad.isSubset(of: $0.bad) && (h.connected || !$0.connected) } == true)
+        // volumes get the resume when they are back; after that the app stays idle. While "Require the SSD" is on,
+        // a dismissed problem isn't quiet: its screen comes back (silently), and only a snooze ends it.
+        let wasDismissed = dismissed.map { bad.isSubset(of: $0.bad) && (h.connected || !$0.connected) } == true
+        let quiet = (phase == .idle && wasDismissed && !requireActive)
             || (phase == .asking && h.connected && bad.isSubset(of: askingCovers))
         if quiet, bad.isSubset(of: alarmed) {
             problemSince = nil
@@ -383,7 +422,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         alarmed.formUnion(bad)
         if quiet { problemSince = nil; return }                   // recorded for the resume; no alarm
         if phase == .alarm { showAlarm(sound: false); return }   // keep the shown alarm current (only if it changed)
-        showAlarm(sound: true)
+        showAlarm(sound: !wasDismissed)                           // the user has heard about this one already
     }
 
     /// Is the SSD going away on purpose? The app's own eject, or `ssd-off`'s marker, read each time (ssd-off
@@ -459,6 +498,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func ask(_ content: OverlayContent) {
         phase = .asking
         failedStep = nil
+        askingIsSafeToUnplug = false
         askingCovers = Set(currentHealth().bad.map(\.volume.name))
         overlay.show(content)
         statusMenu?.refresh()
@@ -476,12 +516,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         phase = .alarm
         let h = health
         var content: OverlayContent
-        if !h.connected {
+        if !h.connected, waitingForReplug || plannedAway {
+            content = OverlayContent(
+                tone: .info, title: "SSD not connected",
+                message: "The SSD was ejected. Plug it back in (directly into the Mac, not a hub): the resume starts "
+                    + "by itself as soon as it is back.")
+        } else if !h.connected {
             content = OverlayContent(
                 tone: .alarm, title: "SSD disconnected",
                 message: "None of the SSD's volumes are attached. Check the cable and plug the SSD back in "
                     + "(directly into the Mac, not a hub). The resume starts by itself as soon as it is back.")
-            content.buttons = [OverlayButton("Dismiss") { [weak self] in self?.dismissAlarm() }]
         } else {
             let fixable = h.bad.contains { if case .notMounted = $0.state { return true }; if case .elsewhere = $0.state { return true }; return false }
             let readOnly = h.bad.contains { $0.state == .readOnly }
@@ -492,11 +536,20 @@ final class AppController: NSObject, NSApplicationDelegate {
                     : "Check the SSD. Try Remount first. If that doesn't help, unmount the rest, then unplug the SSD and plug it back in.")
             if fixable { content.buttons.append(OverlayButton("Remount", .primary) { [weak self] in self?.remount() }) }
             content.buttons.append(OverlayButton("Unmount the rest") { [weak self] in self?.unmountRest(planned: false) })
+        }
+        // "Require the SSD" on: no Dismiss. The screen stays until the SSD is back, or a snooze (which then
+        // dismisses it the same way).
+        if requireActive {
+            content.message += " This Mac needs the SSD: this screen stays until it is back. To use the Mac without it, snooze “Require the SSD”."
+            content.snoozeLabel = "Snooze “Require the SSD”:"
+            content.snoozeButtons = snoozeButtons { [weak self] in self?.dismissAlarm() }
+        } else {
             content.buttons.append(OverlayButton("Dismiss") { [weak self] in self?.dismissAlarm() })
         }
         content.details = volumeLines(h) + (alarmNote.isEmpty ? [] : [""] + alarmNote)
         // The alarm on screen already says this (an unrelated event or opening the menu): leave it as it is.
-        let key = ([content.title, content.message] + content.details + content.buttons.map(\.title)).joined(separator: "\n")
+        let key = ([content.title, content.message] + content.details + content.buttons.map(\.title)
+                   + content.snoozeButtons.map(\.title)).joined(separator: "\n")
         if alreadyShown, !playSound, key == shownAlarmKey { statusMenu?.refresh(); return }
         shownAlarmKey = key
         overlay.show(content)
@@ -520,6 +573,78 @@ final class AppController: NSObject, NSApplicationDelegate {
         autoStarts = 0   // the user has seen it
         Log.write("alarm dismissed")
         statusMenu?.refresh()
+    }
+
+    // MARK: - require the SSD
+
+    /// On by default: while the SSD isn't fully in place, its screen stays up until the SSD is back or the user
+    /// snoozes this. Read each time (a snooze that has run out counts as on).
+    var requireActive: Bool { Preferences.requireSSD }
+
+    /// The snooze row for a screen: each choice snoozes, then `then` closes that screen.
+    private func snoozeButtons(then: @escaping () -> Void) -> [OverlayButton] {
+        AppController.snoozeChoices.map { choice in
+            OverlayButton(choice.short) { [weak self] in
+                self?.snoozeRequire(for: choice.seconds)
+                then()
+            }
+        }
+    }
+
+    /// Snooze for this long (nil: off until turned back on). It comes back by itself when the time is up.
+    func snoozeRequire(for seconds: TimeInterval?) {
+        Preferences.requireSnoozedUntil = seconds.map { Date().addingTimeInterval($0) } ?? .distantFuture
+        Log.write(seconds.map { "Require the SSD: snoozed for \(Int($0 / 60)) min" } ?? "Require the SSD: off until turned back on")
+        updateSnoozeTimer()
+        statusMenu?.refresh()
+    }
+
+    /// The menu's snooze: also closes the screen that "Require the SSD" kept up, like its own snooze buttons.
+    func snoozeFromMenu(for seconds: TimeInterval?) {
+        let wasActive = requireActive
+        snoozeRequire(for: seconds)
+        guard wasActive else { return }
+        if phase == .alarm { dismissAlarm() } else if phase == .asking, askingIsSafeToUnplug { closeResult() }
+    }
+
+    func turnRequireOn() {
+        Preferences.requireSnoozedUntil = nil
+        Log.write("Require the SSD: on")
+        updateSnoozeTimer()
+        scheduleEvaluate()   // the SSD may be missing right now: its screen comes up
+    }
+
+    /// The snooze's end needs a timer only while the SSD isn't fully in place: then one timer, set for that end
+    /// (wall-clock time, so time asleep counts; a wake looks again anyway). While healthy there is none, as
+    /// everywhere else: the setting is read each time, and a snooze that has run out counts as on. When it ends,
+    /// the mode is on again without a word; if the SSD is still missing, its screen comes up. Called after every
+    /// evaluation and every change of the setting.
+    private func updateSnoozeTimer() {
+        if let until = Preferences.requireSnoozedUntil, until <= Date() {
+            Preferences.requireSnoozedUntil = nil
+            Log.write("Require the SSD: on again (snooze ended)")
+        }
+        let until = Preferences.requireSnoozedUntil
+        let target = until != nil && until != .distantFuture && watcher != nil && configError == nil && !health.allOK
+            ? until : nil
+        guard target != snoozeTimerFor else { return }
+        snoozeTimer?.cancel()
+        snoozeTimer = nil
+        snoozeTimerFor = target
+        guard let target else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(wallDeadline: .now() + max(0, target.timeIntervalSinceNow) + 0.5, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.snoozeTimer?.cancel()
+                self.snoozeTimer = nil
+                self.snoozeTimerFor = nil
+                self.evaluate()   // the snooze has run out: on again (updateSnoozeTimer logs it), screen if needed
+            }
+        }
+        timer.resume()
+        snoozeTimer = timer
     }
 
     private func volumeLines(_ h: Health) -> [String] {
@@ -729,18 +854,33 @@ final class AppController: NSObject, NSApplicationDelegate {
                 // A confirmed unplug: no alarm while the SSD is away, also after an app restart (see isPlanned).
                 try? Data("\(Int(Date().timeIntervalSince1970))\nejected\n".utf8)
                     .write(to: URL(fileURLWithPath: Paths.plannedMarker))
-                var content = OverlayContent(
-                    tone: .info, title: "Safe to unplug",
-                    message: "Unplug the SSD, wait 5 seconds, then plug it back in. The resume starts by itself as soon as it is back.")
-                content.buttons = [OverlayButton("OK", .primary) { [weak self] in self?.closeResult() }]
-                content.onClick = { [weak self] in self?.closeResult() }
-                self.ask(content)
+                self.showSafeToUnplug()
             } else {
                 self.unmountProblem(planned: planned, title: "Eject failed",
                                     message: r.timedOut ? "diskutil did not finish within 60 seconds and was stopped." : (r.lines("FAILED").first?.first ?? r.tail(1).first ?? ""),
                                     details: [], retry: { [weak self] in self?.eject(planned: planned) })
             }
         }
+    }
+
+    /// The eject's last screen. While "Require the SSD" is on it stays up like the alarm: only the SSD's return or
+    /// a snooze ends it. Otherwise OK or a click closes it. Rebuilt if the mode changes while it is up (evaluate).
+    private func showSafeToUnplug() {
+        var content = OverlayContent(
+            tone: .info, title: "Safe to unplug",
+            message: "Unplug the SSD, wait 5 seconds, then plug it back in. The resume starts by itself as soon as it is back.")
+        let require = requireActive
+        if require {
+            content.message += " This Mac needs the SSD: this screen stays until it is back. To use the Mac without it, snooze “Require the SSD”."
+            content.snoozeLabel = "Snooze “Require the SSD”:"
+            content.snoozeButtons = snoozeButtons { [weak self] in self?.closeResult() }
+        } else {
+            content.buttons = [OverlayButton("OK", .primary) { [weak self] in self?.closeResult() }]
+            content.onClick = { [weak self] in self?.closeResult() }
+        }
+        ask(content)
+        askingIsSafeToUnplug = true
+        safeToUnplugRequires = require
     }
 
     private func unmountProblem(planned: Bool, title: String, message: String, details: [String], retry: @escaping () -> Void) {
@@ -978,6 +1118,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func closeResult() {
         overlay.close()
         failedStep = nil
+        askingIsSafeToUnplug = false
         phase = .idle
         statusMenu?.refresh()
         scheduleEvaluate()

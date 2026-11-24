@@ -128,9 +128,17 @@ waits.
 ### When something goes wrong
 
 A full-screen alert with a sound, like the one at the top of this page.
-- **A folder is missing:** the alert offers **Remount** to fix it, **Unmount the rest** to disconnect safely, or
-  **Dismiss**.
+- **A folder is missing:** the alert offers **Remount** to fix it, or **Unmount the rest** to disconnect safely.
 - **The whole SSD is unplugged:** the alert tells you to plug it back in. Nothing else to do.
+
+### Require the SSD
+
+Our Macs can't really be used without the SSD, so by default the alert can't just be dismissed. It stays on
+screen until the SSD is back, even after you eject it on purpose, so a forgotten SSD doesn't go unnoticed.
+
+To use the Mac without the SSD for a while, snooze it from the alert or the menu: **10 min**, **30 min**,
+**1 hour**, **1 day** or **Forever**. When the snooze runs out, it turns back on by itself, and if the SSD is
+still missing, the alert comes back.
 
 ### When the SSD is back
 
@@ -151,8 +159,9 @@ The SSD's free space, each folder's state, and a few actions.
 </p>
 
 > [!NOTE]
-> Unplugging on purpose? Choose **Safely eject the SSD…** in the menu first. Then there is no alert while it's
-> away, and the recovery runs when you plug it back in.
+> Unplugging on purpose? Choose **Safely eject the SSD…** in the menu first. Then there is no alarm sound, the
+> screen tells you it's safe to unplug, and the recovery runs when you plug it back in. Snooze the screen there
+> if you'll use the Mac without the SSD for a while.
 
 ## 🚀 Doing this on your Mac
 
