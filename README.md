@@ -11,7 +11,7 @@ So we moved those folders onto an external SSD that stays plugged in. This repo 
 and a small menu bar app, **SSD Monitor**, that keeps an eye on the SSD.
 
 <p align="center">
-  <img src="docs/images/alert.png" width="520" alt="SSD Monitor's alert: SSD problem, 1 of 7 volumes not in place, with Remount, Unmount the rest and Dismiss buttons">
+  <img src="docs/images/alert.png" width="520" alt="SSD Monitor's alert: SSD problem, 1 of 7 volumes not in place, with Remount and Unmount the rest buttons, and the choices to snooze Require the SSD for 10 min, 30 min, 1 hour, 1 day or forever">
 </p>
 
 ## 🎯 The goal
@@ -155,7 +155,7 @@ It runs the recovery by itself. When it's done, it shows a green check and anyth
 The SSD's free space, each folder's state, and a few actions.
 
 <p align="center">
-  <img src="docs/images/menu.png" width="360" alt="SSD Monitor's menu: SSD free space, the seven volumes with check marks, Run resume now, Safely eject the SSD, Alert sound, Launch at login, Open log, Quit">
+  <img src="docs/images/menu.png" width="380" alt="SSD Monitor's menu: SSD free space, the seven volumes with check marks, Run resume now, Safely eject the SSD, Open Statistics, Require the SSD, Alert sound, Test the alarm sound, Launch at login, Open log, Settings, Quit">
 </p>
 
 > [!NOTE]
@@ -166,10 +166,14 @@ The SSD's free space, each folder's state, and a few actions.
 ### Statistics
 
 **Open Statistics…** in the menu shows how fast the SSD reads and writes: right now, and as a graph of the last
-10 minutes. Hover over the graph to see any second. Tick or untick volumes to look at just the ones you care
-about, and see which programs are reading and writing them right now, and how much each has read and written
-since you opened the window, per volume. It also shows the highest speeds since you opened it, and how much
-has been read and written since the SSD was plugged in.
+10 minutes, reads going up and writes going down (hover over it to see any second). Tick or untick volumes to
+look at just the ones you care about, and see which programs are reading and writing them right now, and how
+much each has read and written since you opened the window, per volume. It also shows the highest speeds since
+you opened it, and how much has been read and written since the SSD was plugged in.
+
+<p align="center">
+  <img src="docs/images/statistics.png" width="860" alt="SSD Statistics window: read and write speed, a 10-minute graph, the volumes with checkboxes and their speeds, the programs of the last 3 seconds, and each program's reads and writes since the window opened, per volume">
+</p>
 
 It only runs while the window is open, and starts fresh each time you open it.
 
