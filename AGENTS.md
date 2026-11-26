@@ -504,20 +504,21 @@ normal quit. Each command's temp files live in a folder of its own, removed when
   scaled down to the disk's, and the next second's catch-up shows as shared), so the totals are the checked
   rows.
 - the programs reading and writing the checked volumes, averaged over the last 3 whole seconds, busiest first,
-  all of them (the lists scroll).
+  all of them (the list scrolls).
 - since the window opened (user decisions, 2026-11-26; nothing is kept after it closes): the highest read and
   write speed for the whole SSD, with the time of each, and per volume (Max read, Max write columns); and every
   program's reads and writes, grouped by program (its totals, then one line per volume it used), busiest first,
-  following the checkboxes. Its title says since when it counts (when tracing really began, if later than the
-  window), and an orange note lists known gaps (the program list stopped for a while, fs_usage dropped events).
-  It is redrawn only when it changed, and shows at most 300 lines: the busiest programs in order until one
-  doesn't fit, then "N more programs, with less traffic, not shown" (per-volume lines are made only for the
-  programs shown), so a window left open while thousands of differently named programs ran stays light. A
-  replaced trace's last data, its start and its dropped-event reports still reach the history. Only the top 150
-  programs are kept in order (totals only grow, so one outside can only come in); unchecked volumes' traffic is
-  kept but doesn't redraw it. Its start is compared on the monotonic clock. Out of scope (rare races): macOS
-  reusing a disk name in the moment a trace is retired, and a failed registry lookup at arrival followed by a
-  replug before Statistics reads it.
+  following the checkboxes, each program's lines on a shaded band every other program, with a bar of its reads
+  (pink) and writes (blue) next to the busiest program's. Its title says since when it counts (when tracing really
+  began, if later than the window), and an orange note lists known gaps (the program list stopped for a while,
+  fs_usage dropped events). It is redrawn only when it changed, and shows at most 300 lines: the busiest programs
+  in order until one doesn't fit, then a last line (counted in the 300, and only when programs are left out) "N
+  more programs, not shown" (per-volume lines are made only for the programs shown), so a window left open while
+  thousands of differently named programs ran stays light. A replaced trace's last data, its start and its
+  dropped-event reports still reach the history. Only the top 150 programs are kept in order (totals only grow, so
+  one outside can only come in); unchecked volumes' traffic is kept but doesn't redraw it. Its start is compared
+  on the monotonic clock. Out of scope (rare races): macOS reusing a disk name in the moment a trace is retired,
+  and a failed registry lookup at arrival followed by a replug before Statistics reads it.
 - "Since plugged in at <time>: <read>, <written>": the whole disk's own counters, which start when the SSD is
   attached. macOS doesn't record when that was, so AppController notes it when it sees the SSD arrive (one
   registry lookup per plug-in, in `evaluate`; retried when Statistics asks if it failed) and saves it with the
@@ -527,7 +528,26 @@ normal quit. Each command's temp files live in a folder of its own, removed when
   SSD that turns up then counts as already there; the arrival's time is when DiskWatcher listed it. An attachment the app never saw arrive says "before SSD Monitor
   started"; the time shows only when its ID matches the counters being shown, and a late ID lookup is used only
   within the same attachment.
-- the lists scroll if the window is too short for them; the graph keeps at least 150 points.
+- layout (user decision, 2026-11-26: the window must never grow with a list, and the history uses the full width):
+  the header and totals, the graph (190 points, down to 130 in a small window), then Volumes and "Programs, last 3
+  seconds" side by side, both as tall as the volumes (6 to 10 rows, so a short volume list still leaves room for
+  the setup note and button; more volumes scroll), then the history across the full width, taking the rest of the
+  height. Each list is a plain table (`StatTable`) in a rounded box like the graph's, with its own scrolling and
+  fixed row heights, so nothing in the window depends on how many rows there are. Columns can't be resized by
+  hand, and the spare width goes to the name column (in the history, to the bar column), set by StatTable itself
+  whenever the box changes size, including when the window opens (AppKit's column autoresizing only follows a
+  later resize, so a window reopened at its narrowest cut the last columns off): the columns always fit. The
+  window's smallest size shows all of it; it keeps the size it is given (saved as "SSD Statistics window"; the
+  earlier layout's saved frame, which had grown with the history, is dropped) and is never larger than the screen:
+  the graph's 190 points give way to the window's size (priority 490, below the window's own 500), and the
+  smallest size is measured with the graph at 130. The screen check is made when the window opens; a window
+  dragged onto a smaller display afterwards behaves like any other window (resizing it during the drag would fight
+  the user). Out of scope: a screen narrower or shorter than that smallest size (860 by about 760 points with 8
+  volumes) cuts the window off. The tables are refreshed in place each second: the rows on screen get their new
+  values, and only a change in the number of rows adds or removes any, so a checkbox being clicked keeps its view
+  and the scroll position stays. An empty list shows its note (or the Set Up… button) over the rows. A "May be
+  incomplete" note sits beside the live list's title while fs_usage reports dropped events, and the history's gap
+  note beside its title (cut short, full text in the tooltip).
 
 **Nothing of it runs while the window is closed** (user rule). Opening it starts a 1-second timer and the program
 list; closing it stops both and drops what was collected. It opens empty, with a spinner until the first second
@@ -707,6 +727,7 @@ Measured on the source Mac, healthy, over 60 s: **0.0% CPU, 0 wake-ups, 14 MB.**
 | `Sources/SSDMonitor/Overlay.swift` | The full-screen overlay |
 | `Sources/SSDMonitor/StatusMenu.swift` | Menu bar icon and menu |
 | `Sources/SSDMonitor/StatsWindow.swift` | The Statistics window and its graph |
+| `Sources/SSDMonitor/StatTable.swift` | The Statistics window's tables (rounded box, in-place refresh) |
 | `Sources/SSDMonitor/DiskCounters.swift` | The SSD's byte counters from the IORegistry |
 | `Sources/SSDMonitor/ProgramTrace.swift`, `FsUsageLine.swift` | fs_usage through the sudo rule, and its line parser |
 | `Sources/SSDMonitor/SudoRule.swift` | Adding and removing the sudo rule behind the password dialog |
