@@ -11,7 +11,8 @@ func onMain(after delay: TimeInterval, _ body: @escaping @MainActor () -> Void) 
 /// - "Require the SSD" (on by default): no Dismiss; the screen stays until the SSD is back or the user snoozes
 ///   the mode, and also comes up (silently) once the SSD is away on purpose.
 /// - the SSD back after an unplug (or a problem fixed in place): the resume, with its progress overlay.
-/// Everything is driven by disk events. While the SSD is healthy there is no timer at all.
+/// Everything is driven by disk events. While the SSD is healthy there is no timer at all, except while the
+/// Statistics window is open (it reads the SSD's counters once a second, and stops when it closes).
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate {
     enum Phase {
@@ -65,6 +66,25 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var snoozeTimerFor: Date?                // the snooze end it is set for
     private var askingIsSafeToUnplug = false         // the asking screen is the eject's "Safe to unplug"
     private var safeToUnplugRequires = false         // and it was built while "Require the SSD" was on
+    private var statsWindow: StatsWindow?            // the windows exist only while open
+    private var settingsWindow: SettingsWindow?
+    private var setupWindow: SetupWindow?
+    private let adminPasswordWatch = PasswordWatch()   // while a sudo rule change waits for the password
+    private var adminTasks = 0
+    private var activeAdmin: AdminTask?   // kept until osascript exits, so quitting can end it
+    /// The setup is adding a rule and then checks it with its own trace: Statistics holds off its trace until
+    /// that is done (the kernel allows one trace at a time).
+    var sudoRuleVerifying = false {
+        didSet {
+            guard oldValue != sudoRuleVerifying, !quitting else { return }
+            if sudoRuleVerifying { statsWindow?.holdTrace(); settingsWindow?.refresh() } else { sudoRuleChanged() }
+        }
+    }
+    private var quitting = false
+    /// What fs_usage last showed about the rule in this run of the app: true = sudo ran it, false = sudo
+    /// wanted a password although the file is there; nil = not tried since the file last changed.
+    private(set) var sudoRuleWorks: Bool?
+    private(set) var sudoRuleRefusal: String?   // what sudo said when it didn't run fs_usage
 
     /// "Require the SSD"'s snooze choices: the overlay's short label, the menu's, and the length (nil = off
     /// until turned back on).
@@ -106,8 +126,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         passwordWatch.onChange = { [weak self] visible in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                if visible { self.job?.pauseTimeout(); self.overlay.hide() } else { self.job?.resumeTimeout(); self.overlay.unhide() }
+                if visible { self.job?.pauseTimeout(); self.overlay.hide(for: "job") } else { self.job?.resumeTimeout(); self.overlay.unhide(for: "job") }
                 self.statusMenu?.refresh()
+            }
+        }
+
+        adminPasswordWatch.onChange = { [weak self] visible in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if visible { self.overlay.hide(for: "admin") } else { self.overlay.unhide(for: "admin") }
             }
         }
 
@@ -131,17 +158,39 @@ final class AppController: NSObject, NSApplicationDelegate {
         termSignal = term
 
         Preferences.setUpLaunchAtLoginOnce()
+        UI.installMainMenu(settings: (self, #selector(openSettingsAction(_:))))
         loadVolumes()
         statusMenu?.refresh()
+        showWelcomeOnce()
     }
 
     /// Quitting while a command runs (the menu, or an update): stop it and everything it started first, so
     /// nothing keeps mounting or unmounting with nobody watching. Takes at most a third of a second.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        quitting = true   // nothing may start a trace from here on
         if job != nil || runner != nil { Log.write("quit: stopping what runs") }
         job?.killNow()
         runner?.killNow()
-        return .terminateNow
+        statsWindow?.stop()      // fs_usage, if it runs
+        setupWindow?.stop()
+        settingsWindow?.stop()
+        activeAdmin?.killNow()   // a password dialog still up goes with the app
+        // A stop sudo refused while starting (it runs as root for a moment) must land before the app goes, or
+        // fs_usage could start with no one left to stop it: wait for it (sudo's own limit ends it at the latest).
+        guard ProgramTrace.finishStopping() else { return .terminateNow }
+        Log.write("quit: waiting for sudo to accept the stop")
+        let deadline = ProgramTrace.clock + TimeInterval(SudoRule.sudoTimeout)
+        // A run-loop timer in the common modes: AppKit waits for the reply in a nested run loop, possibly inside a
+        // main-queue block (the SIGTERM handler), where queued main-queue work wouldn't run but timers do.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                guard !ProgramTrace.finishStopping() || ProgramTrace.clock >= deadline else { return }
+                timer.invalidate()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return .terminateLater
     }
 
     /// The volume list comes from ssd-resume, so the app and the scripts can't disagree. It runs as a job
@@ -180,7 +229,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         volumes = valid
         Log.write("watching \(volumes.map(\.name).joined(separator: ", "))")
         let watcher = DiskWatcher(uuids: Set(volumes.map(\.uuid)))
-        watcher.onChange = { [weak self] in MainActor.assumeIsolated { self?.scheduleEvaluate() } }
+        watcher.onChange = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.statsWindow?.checkDevices()   // only compares; rebuilds only if the SSD's own disks changed
+                self?.scheduleEvaluate()
+            }
+        }
         self.watcher = watcher
         watcher.start()
         watchMarkerFolder()
@@ -205,6 +259,123 @@ final class AppController: NSObject, NSApplicationDelegate {
         configError = message
         Log.write(message)
         statusMenu?.refresh()
+    }
+
+    // MARK: - statistics, settings, the sudo rule
+
+    var canOpenStatistics: Bool { configError == nil && !volumes.isEmpty }
+
+    func openStatistics() {
+        guard canOpenStatistics else { return }
+        if let statsWindow { return statsWindow.show() }
+        let window = StatsWindow(controller: self, volumes: volumes)
+        window.onClose = { [weak self] in self?.statsWindow = nil }
+        statsWindow = window
+        window.show()
+    }
+
+    func openSettings() {
+        if let settingsWindow { return settingsWindow.show() }
+        let window = SettingsWindow(controller: self)
+        window.onClose = { [weak self] in self?.settingsWindow = nil }
+        settingsWindow = window
+        window.show()
+    }
+
+    /// The setup for the sudo rule. As the welcome screen it is shown once: whatever closes it counts as the
+    /// answer, so it doesn't come back by itself.
+    func showSudoSetup(welcome: Bool) {
+        if let setupWindow { return setupWindow.show() }
+        let window = SetupWindow(controller: self, welcome: welcome)
+        window.onClose = { [weak self] in
+            if welcome { Preferences.welcomeAnswered = true }
+            self?.setupWindow = nil
+        }
+        setupWindow = window
+        window.show()
+    }
+
+    /// The welcome screen, at the first launch without the sudo rule (one file check; nothing else at launch).
+    private func showWelcomeOnce() {
+        guard !Preferences.welcomeAnswered else { return }
+        if SudoRule.isInstalled {
+            Preferences.welcomeAnswered = true
+        } else {
+            Log.write("welcome screen (no sudo rule)")
+            showSudoSetup(welcome: true)
+        }
+    }
+
+    /// The rule file may have changed (a change through the password dialog has ended): what was known about
+    /// whether sudo accepts it no longer holds.
+    func sudoRuleFileChanged() {
+        sudoRuleWorks = nil
+        sudoRuleRefusal = nil
+        setupWindow?.ruleChanged()
+        sudoRuleChanged()
+    }
+
+    /// Bring Settings and Statistics up to date with the rule (Statistics waits while the setup checks it).
+    func sudoRuleChanged() {
+        guard !quitting else { return }
+        settingsWindow?.refresh()
+        if !sudoRuleVerifying { statsWindow?.sudoRuleChanged() }
+    }
+
+    /// A trace started through the rule (true) or sudo wanted a password (false).
+    func sudoRuleTried(works: Bool, refusal: String? = nil) {
+        guard sudoRuleWorks != works || sudoRuleRefusal != refusal else { return }
+        sudoRuleWorks = works
+        sudoRuleRefusal = works ? nil : refusal
+        settingsWindow?.refresh()
+    }
+
+    /// One change to the rule at a time (adding it includes the check that follows).
+    var sudoRuleChanging: Bool { adminTasks > 0 || sudoRuleVerifying }
+
+    @objc func openSettingsAction(_ sender: Any?) { openSettings() }
+
+    /// nil while another change to the rule is still going.
+    func addSudoRule(_ completion: @escaping @MainActor (SudoRule.Outcome) -> Void) -> AdminTask? {
+        runAdmin(SudoRule.installScript(), prompt: SudoRule.installPrompt, label: "add the sudo rule", completion)
+    }
+
+    func removeSudoRule(_ completion: @escaping @MainActor (SudoRule.Outcome) -> Void) -> AdminTask? {
+        guard !sudoRuleVerifying else { return nil }   // not while the setup is adding and checking it
+        return runAdmin(SudoRule.removeScript(), prompt: SudoRule.removePrompt, label: "remove the sudo rule", completion)
+    }
+
+    /// The password dialog may come up under the alarm's screen: the screen steps aside while it is up, as it
+    /// does for the scripts' dialogs. Whatever the window that asked does meanwhile (it may close), the rule is
+    /// looked at again once the change has ended.
+    private func runAdmin(_ shell: String, prompt: String, label: String,
+                          _ completion: @escaping @MainActor (SudoRule.Outcome) -> Void) -> AdminTask? {
+        guard adminTasks == 0 else { return nil }
+        adminTasks += 1
+        if adminTasks == 1 { adminPasswordWatch.start() }
+        let before = SudoRule.signature()
+        let task = AdminTask(shell: shell, prompt: prompt, label: label, onExit: { [weak self] outcome in
+            guard let self else { return }
+            self.adminTasks -= 1
+            self.activeAdmin = nil
+            if self.adminTasks == 0 { self.adminPasswordWatch.stop() }
+            // What was known about the rule goes only if the file changed (a cancelled or failed change leaves it
+            // as it was; one that went through counts even if its osascript was stopped before it could say so).
+            if outcome == .done { SudoRule.lastChange = label == "add the sudo rule" }   // for a folder it can't look into
+            if outcome == .done || SudoRule.signature() != before { self.sudoRuleFileChanged() } else { self.sudoRuleChanged() }
+        }, completion: completion)
+        activeAdmin = task
+        return task
+    }
+
+    /// The setup's volumes that are attached now, with their BSD names and where they are mounted (from
+    /// DiskArbitration's records), and how many times the SSD's disks came or went so far.
+    func ssdDevices() -> (volumes: [(name: String, bsd: String, mountedAt: String?)], attachments: Int) {
+        guard let watcher else { return ([], 0) }
+        let list = volumes.compactMap { volume in
+            watcher.disk(uuid: volume.uuid).map { (volume.name, $0.bsdName, $0.volumePath) }
+        }
+        return (list, watcher.attachments)
     }
 
     // MARK: - evaluate
@@ -958,7 +1129,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         runner.onProgress = { [weak self] in self?.showResumeProgress() }
         runner.onPasswordDialog = { [weak self] visible in
             guard let self else { return }
-            if visible { self.overlay.hide() } else { self.overlay.unhide() }
+            if visible { self.overlay.hide(for: "resume") } else { self.overlay.unhide(for: "resume") }
             self.statusMenu?.refresh()
         }
         runner.onDone = { [weak self] outcome in self?.resumeDone(outcome) }

@@ -12,6 +12,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("DiskArbitration"),
+                .linkedFramework("IOKit"),
                 .linkedFramework("ServiceManagement"),
             ]
         ),

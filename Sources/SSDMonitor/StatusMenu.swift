@@ -114,6 +114,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(action("Run resume now", #selector(runResume), enabled: controller.canResume))
         menu.addItem(action("Safely eject the SSD…", #selector(eject), enabled: controller.canEject))
         menu.addItem(.separator())
+        menu.addItem(action("Open Statistics…", #selector(openStatistics), enabled: controller.canOpenStatistics))
+        menu.addItem(.separator())
 
         menu.addItem(requireItem())
 
@@ -129,6 +131,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(login)
         menu.addItem(action("Open log", #selector(openLog)))
         menu.addItem(.separator())
+        let settings = action("Settings…", #selector(openSettings))
+        settings.keyEquivalent = ","
+        menu.addItem(settings)
         menu.addItem(action("Quit SSD Monitor", #selector(quit)))
     }
 
@@ -202,6 +207,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func eject() { controller.confirmEject() }
     @objc private func testSound() { controller.testSound() }
     @objc private func openLog() { NSWorkspace.shared.open(Log.url) }
+    @objc private func openStatistics() { controller.openStatistics() }
+    @objc private func openSettings() { controller.openSettings() }
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func requireOn() { controller.turnRequireOn() }

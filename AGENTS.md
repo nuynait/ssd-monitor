@@ -417,11 +417,13 @@ eject, or one volume unmounted), its screen stays up until the SSD is back or th
 - show the alert
 - run resume now
 - safely eject
+- Open Statistics… (below)
 - Require the SSD: on, snoozed (until when), or off; its submenu turns it on or snoozes it. A snooze from the
   menu also closes the screen the mode kept up.
 - the alarm sound (any macOS alert sound, or none)
 - launch at login
 - the log
+- Settings… (below)
 - quit
 
 **Remount** mounts the missing volumes with a plain `diskutil mount`, which follows `/etc/fstab` and needs no
@@ -488,6 +490,137 @@ once they are back.
 **Quitting** while a command runs stops that command, and everything it started, first. SIGTERM counts as a
 normal quit. Each command's temp files live in a folder of its own, removed when it ends.
 
+### Statistics, Settings and the sudo rule
+
+**Open Statistics…** opens an ordinary window (user request, 2026-11-25):
+- the SSD's read and write speed now, large
+- a graph of the last 10 minutes, one bar per reading (about a second; a late reading's bar covers its whole
+  interval and says "average"): reads up from the middle line, writes down, each half scaled to its highest bar
+  in view. Hovering shows that bar's time and speeds.
+- a checkbox per volume, with each volume's speeds. Unchecking one takes it out of the graph, the totals and the
+  program list. The last row, **APFS shared**, is the SSD's traffic that no volume owns (APFS's checkpoints and
+  space maps): the whole disk's counters minus the volumes'. The rows always add up to the whole disk's own
+  counters (in a busy second the volumes' counters, read just before the disk's, can run ahead; then they are
+  scaled down to the disk's, and the next second's catch-up shows as shared), so the totals are the checked
+  rows.
+- the programs reading and writing the checked volumes, averaged over the last 3 whole seconds, busiest first,
+  all of them (the lists scroll).
+- the lists scroll if the window is too short for them; the graph keeps at least 150 points.
+
+**Nothing of it runs while the window is closed** (user rule). Opening it starts a 1-second timer and the program
+list; closing it stops both and drops what was collected. It opens empty, with a spinner until the first second
+is in, and keeps nothing from before it opened.
+- If the SSD goes away while it is open, the graph stops on "SSD not connected", its axis says when it was
+  unplugged ("SSD disconnected" if the window never saw it), and it continues when the SSD is back.
+- The counters are looked up again only when the SSD's own disks come or go (DiskWatcher counts them, so a fast
+  replug under the same names counts too): new counters and a new trace. A volume only moving to another mount
+  point just updates the paths.
+- Its clock keeps running while the Mac sleeps, and a reading more than 5 s after the one before starts afresh:
+  a sleep shows as a gap, not as an average, and nothing from before it counts as current.
+- A counter missing for a reading (right after a replug) leaves a gap too, never a partial sum, and the registry
+  entries are looked up again; the program list carries on (fs_usage still ran).
+
+Where the numbers come from:
+- **Speeds:** the kernel's byte counters, read from the IORegistry once a second: each APFS volume's "Bytes read
+  from block device" and "Bytes written to block device" (reads served from memory don't count), and the whole
+  disk's IOBlockStorageDriver "Bytes (Read)" and "Bytes (Write)", the numbers `iostat` shows. They start at zero
+  when the SSD is attached; a counter that goes backwards counts as a new start. One read of all of them takes
+  about 0.3 ms.
+- **Programs:** macOS counts a program's disk traffic for all disks together, so only Apple's `fs_usage`, which
+  needs root, can tell which disk each read or write goes to. The app runs
+  `sudo -k -n -T 40 /usr/bin/fs_usage -w -f diskio -t 30` while the window is open: `-k`, a cached sudo login
+  doesn't count, only the rule; `-n`, never a password prompt; `-T 40`, sudo's own time limit. (Not `-F`, which
+  keeps a long path's front: macOS 14.5 and 14.6's fs_usage don't have it.)
+- Of fs_usage's lines it keeps those whose device is on the SSD. A volume's device names its volume. The whole
+  disk, the container or a partition goes by the file's path when it is surely whole, matched against where each
+  volume is mounted right now (fs_usage prints " <path> " padded to its column; a path with no padding left
+  filled the column and may have lost its front, so it isn't used); otherwise to APFS shared. Paths are never
+  stored.
+- The line format is fs_usage.c's `format_print` for disk I/O, read field by field from the timestamp on (a path
+  with a line break splits its record; both halves are dropped). The program name is the text after the last
+  elapsed-time field, minus the thread ID. Sums saturate instead of overflowing. macOS keeps only the first 16
+  bytes of a program's name; a name that long gets "…" and a tooltip, since programs whose names start alike are
+  counted together. When fs_usage reports a buffer overrun (a Mac too busy to trace everything), the list says it
+  may be incomplete for 10 s.
+- The program rates divide by the time fs_usage actually traced within those seconds: each run counts from its
+  first record (sudo's own start-up isn't tracing time) to its end as seen by the thread that reaped it, so the
+  short gap between runs, a late start or the SSD coming back don't dilute them.
+
+How fs_usage is run and stopped:
+- It writes to a pseudo-terminal, so it sends each line at once (to a pipe it would send 16 KB blocks, seconds
+  late on a quiet Mac). Each run ends by itself after 30 s (`-t 30`) and the app starts the next one while the
+  window is open.
+- sudo's time limit (`-T 40`, allowed for fs_usage only by the rule file's
+  `Defaults!/usr/bin/fs_usage user_command_timeouts`, plus the rule's own `TIMEOUT=40`) keeps sudo as fs_usage's
+  supervisor whichever rule matches (Apple's sudo runs a command in its own place only when it has no time
+  limit: `direct_exec_allowed` in sudo's exec.c), so the app can always signal it, and sudo ends fs_usage after
+  40 s even if it hangs. So a trace can't outlive the app by more than 40 s, whatever happens to the app.
+- `ChildProcess` starts it (and the password dialog's osascript) with `posix_spawn`: a session of its own (no
+  controlling terminal, so sudo never moves fs_usage onto a terminal of its own, even if the app was started
+  from one), only stdin, stdout and stderr open, and default signal handling (the app ignores SIGTERM itself; a
+  child would inherit that and could drop the stop signal). A background thread waits for the child, sees the
+  exit without reaping it (`waitid` with `WNOWAIT`), makes the process ID unsignalable under a lock (so a stop
+  can never signal a reused ID), then reaps it. For a trace, the reader then takes in the run's last output
+  before the exit is reported.
+- Closing the window stops reading and sends SIGTERM to sudo, which passes it on. While sudo starts it briefly
+  runs as root and refuses the signal (EPERM); the app then tries again every 0.2 s until it lands, and quitting
+  waits for that (at most sudo's 40 s), so fs_usage can't start with no one left to stop it. That wait uses a
+  run-loop timer: AppKit waits for the reply in a nested run loop, sometimes inside a main-queue block (the
+  SIGTERM handler), where queued main-queue work wouldn't run.
+- The kernel allows one trace at a time, so a trace starts only once every earlier one (the setup's check, a
+  closed window's) has exited, and a trace that wants its next run lets a waiting one go first. If the app
+  crashed while a trace ran, that fs_usage holds the kernel's trace until sudo's limit ends it; a trace started
+  meanwhile says another one is running and to try again shortly.
+- The app reports "running" once the first complete disk I/O record arrives (any disk), or once a run went its
+  full 30 s and ended cleanly (a Mac too quiet for any record): proof that sudo ran fs_usage. Any "sudo:" message
+  means sudo didn't (no rule, one it ignores, a policy that refuses the time limit or wants a terminal); its words
+  are shown.
+- While the window is open, the rule file is checked every second (one `stat`) and before each new run: if it has
+  gone (removed in Settings or by hand), the trace stops and the window offers **Set Up…**; if it changed (inode,
+  size or change time), the trace starts over so sudo decides again; if it appears (added by hand), the trace
+  starts.
+
+**The sudo rule** is one file per user, `/etc/sudoers.d/ssd-monitor-<uid>`, holding a comment (no account name,
+so renaming the account changes nothing), `Defaults!/usr/bin/fs_usage user_command_timeouts` (lets the app set
+fs_usage's time limit, nothing else) and `#<uid> ALL=(root) TIMEOUT=40 NOPASSWD: /usr/bin/fs_usage -w -f diskio -t 30`,
+by user ID because a user name could be a sudoers keyword. It allows exactly that command; fs_usage with other
+arguments, and every other command, still ask for the password. Any program running as the user could run the
+same command and see which files programs read and write; it can't change anything.
+- Added and removed through macOS's own administrator password dialog (`osascript`, `do shell script … with
+  administrator privileges`), so the app never sees the password. One change at a time; Remove waits while the
+  setup adds and checks the rule. While the dialog is up an alarm screen steps aside, as for the scripts'
+  dialogs; the overlay remembers who asked it to (the scripts, the resume, a rule change), so one finishing can't
+  bring it back over another's dialog. Quitting ends a pending password dialog.
+- Both changes first require sudo's whole configuration to pass `visudo -c`, and the file to be exactly what this
+  app writes, or empty (compared byte for byte with `cmp`: an edited, trimmed or reordered file is left alone);
+  otherwise nothing changes.
+- Adding: written to a temp name (sudo ignores names with a dot), checked with `visudo -c -O -P -f` (syntax,
+  owner and mode), renamed into place over any earlier copy (kept aside under a unique name), then the whole
+  configuration is checked again; if that fails, the earlier copy comes back, or the file goes.
+- **Removing empties the file** (one rename) instead of deleting it: an empty sudoers file is valid and grants
+  nothing, and a file that something else names (an explicit include) can't go missing. The app counts an empty
+  file as "not set up". A copy is kept aside until the configuration passes, and stays if putting it back fails.
+- Every case was tested in a scratch folder, including both checks failing and edited files.
+- Whether a change went through is also told by the file's inode, size and change time, so a change whose
+  osascript was stopped after it happened still counts.
+- After adding it, the app starts fs_usage through it once to prove sudo accepts it, then shows the green check.
+  The check allows 50 s for an earlier trace to end, then 40 s from its own fs_usage's first start. An open
+  Statistics window lets go of its trace (or holds off starting one) from the moment Set Up is pressed until the
+  check is done. However a change ends (even if its window was closed), the app looks at the rule again; a
+  finished setup window whose rule has gone starts over.
+- Settings shows **Not working** (with **Set Up Again…**, and sudo's own words) when the file is there but sudo
+  didn't run fs_usage, for example on a Mac whose `/etc/sudoers` doesn't include `/etc/sudoers.d`.
+- If `/etc/sudoers.d` can't be looked into (a root-only folder), the rule counts as what the app last did to it
+  in this run (added or removed), else as maybe there, and sudo decides when Statistics starts its trace. (A
+  `/etc/sudoers.d` an ordinary account could write to is out of scope: such a Mac is compromised anyway.)
+- **Welcome screen:** at the first launch without the rule, explains it, with **Set Up…** (password, check, green
+  check, **Finish**) and **Not now**. Shown once: whatever closes it counts as the answer (`welcomeAnswered` in
+  the app's defaults). At launch the app only checks whether the file exists.
+- **Settings…** (⌘, from the menu or any of the app's windows) shows the rule's state with **Set Up…** or
+  **Remove…**. The other settings stay in the menu.
+- Without the rule, Statistics shows the graph and volumes, and "The program list needs a one-time setup" with a
+  **Set Up…** button that opens the same setup.
+
 ### Built to cost nothing while healthy
 
 It runs all day, so the healthy state has to be free:
@@ -503,6 +636,9 @@ It runs all day, so the healthy state has to be free:
   - the grace periods (20 s after launch, 10 s after a wake), on a monotonic clock
   - a running step's time limit
   - the once-a-second password-dialog check while a command or the resume runs
+
+  The one exception is a window the user opened: the Statistics window's 1-second timer and its fs_usage run
+  only while it is open (and sudo ends fs_usage within 40 s even if the app doesn't stop it).
 - **The health check reads the kernel's cached mount table**: `getfsstat` with `MNT_NOWAIT` (one call for the
   count, one for the entries). It can't block even on a dying disk. Free space comes from the same call, when the menu opens.
 - **The app never touches the SSD itself.** Mounting, the write check, `lsof` and the rest run as script steps
@@ -548,13 +684,21 @@ Measured on the source Mac, healthy, over 60 s: **0.0% CPU, 0 wake-ups, 14 MB.**
 | `Sources/SSDMonitor/Job.swift` | Running a script step with a pausable time limit; password-dialog detection |
 | `Sources/SSDMonitor/Overlay.swift` | The full-screen overlay |
 | `Sources/SSDMonitor/StatusMenu.swift` | Menu bar icon and menu |
-| `Sources/SSDMonitor/Preferences.swift` | Alarm sound, launch at login |
+| `Sources/SSDMonitor/StatsWindow.swift` | The Statistics window and its graph |
+| `Sources/SSDMonitor/DiskCounters.swift` | The SSD's byte counters from the IORegistry |
+| `Sources/SSDMonitor/ProgramTrace.swift`, `FsUsageLine.swift` | fs_usage through the sudo rule, and its line parser |
+| `Sources/SSDMonitor/SudoRule.swift` | Adding and removing the sudo rule behind the password dialog |
+| `Sources/SSDMonitor/SetupWindow.swift`, `SettingsWindow.swift` | The welcome/setup screen, Settings |
+| `Sources/SSDMonitor/ChildProcess.swift` | Starting, signalling and reaping sudo and osascript safely |
+| `Sources/SSDMonitor/Windows.swift` | Shared window helpers, speed formatting |
+| `Sources/SSDMonitor/Preferences.swift` | Alarm sound, launch at login, "Require the SSD", the welcome screen |
 | `Sources/SSDMonitor/Support.swift` | Volume list, paths, script protocol check, log |
 | `helpers/` | The scripts the app runs, and the Mac's setup (`ssd-volumes.sh`) |
 | `scripts/install.sh`, `scripts/build.sh` | Install everything / build the app |
 
-The app has no paths of its own except `~/Local/bin` (the scripts) and `~/Local/ssd` (the planned-unplug
-marker). It reads the volume list from `ssd-resume --step list`.
+The app has no paths of its own except `~/Local/bin` (the scripts), `~/Local/ssd` (the planned-unplug
+marker) and, only once the user sets it up, `/etc/sudoers.d/ssd-monitor-<uid>`. It reads the volume list from
+`ssd-resume --step list`.
 
 ## 8. The helper scripts (`helpers/`)
 
@@ -799,8 +943,8 @@ rule up when they restart.
 ## 13. Working on this repo
 
 - **Efficiency comes first.** Nothing may run while the SSD is healthy: no timers, no polling, no child
-  processes. A change for efficiency must not break a working feature; test it against the existing behavior,
-  including the failure cases.
+  processes. The only exception is the Statistics window, and only while it is open. A change for efficiency
+  must not break a working feature; test it against the existing behavior, including the failure cases.
 - **Builds have 0 warnings.** Swift 6 toolchain, Swift 5 language mode, AppKit only, `@MainActor` classes.
 - **Shell scripts** target `/bin/bash` 3.2 with `set -u`. Use `${a[@]+"${a[@]}"}` for arrays that may be empty,
   and no bash 4 features.

@@ -5,6 +5,7 @@ enum Preferences {
     private static let soundKey = "alertSound"
     private static let loginSetUpKey = "loginItemSetUp"
     private static let requireKey = "requireSSDSnoozedUntil"
+    private static let welcomeKey = "welcomeAnswered"
     static let defaultSound = "Sosumi"
 
     /// "Require the SSD" (on by default): nil = on; a date = snoozed until then, `.distantFuture` = off until
@@ -18,6 +19,12 @@ enum Preferences {
     }
 
     static var requireSSD: Bool { requireSnoozedUntil.map { $0 <= Date() } ?? true }
+
+    /// The welcome screen (set up the sudo rule) was answered: set up, "Not now", or closed. It is shown once.
+    static var welcomeAnswered: Bool {
+        get { UserDefaults.standard.bool(forKey: welcomeKey) }
+        set { UserDefaults.standard.set(newValue, forKey: welcomeKey) }
+    }
 
     /// The alarm sound's name, or nil for no sound.
     static var alertSound: String? {

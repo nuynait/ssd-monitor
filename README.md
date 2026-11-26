@@ -163,6 +163,19 @@ The SSD's free space, each folder's state, and a few actions.
 > screen tells you it's safe to unplug, and the recovery runs when you plug it back in. Snooze the screen there
 > if you'll use the Mac without the SSD for a while.
 
+### Statistics
+
+**Open Statistics…** in the menu shows how fast the SSD reads and writes: right now, and as a graph of the last
+10 minutes. Hover over the graph to see any second. Tick or untick volumes to look at just the ones you care
+about, and see which programs are reading and writing them.
+
+It only runs while the window is open, and starts fresh each time you open it.
+
+The program list needs a one-time setup: only macOS's `fs_usage` tool, run as an administrator, can tell which
+disk a program is using. The first time the app starts, a welcome screen offers to add a sudo rule that lets it
+run exactly `fs_usage -w -f diskio -t 30` without asking for a password (each run stops by itself after
+30 seconds). You type your password once, and you can remove the rule any time in **Settings…**.
+
 ## 🚀 Doing this on your Mac
 
 Every Mac has different folders, tools and space, so don't copy our setup as is. Let your coding agent work it out

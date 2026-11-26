@@ -21,6 +21,9 @@ final class DiskWatcher {
     /// The last of the SSD's disks disappeared since `takeAllGone()` was last asked: a disconnect, even if
     /// the SSD is back before the app looks.
     private var allGone = false
+    /// Counts the SSD's disks appearing and disappearing: a change means a new attachment (new byte counters),
+    /// even if the disks came back under the same names.
+    private(set) var attachments = 0
     var onChange: (() -> Void)?
 
     init(uuids: Set<String>) {
@@ -103,6 +106,7 @@ final class DiskWatcher {
         let new = Disk(bsdName: bsd, uuid: uuid, volumePath: path)
         let old = disks[bsd]
         disks[bsd] = new
+        if old == nil { attachments += 1 }
         if old?.volumePath != new.volumePath || old == nil { onChange?() }
     }
 
@@ -113,6 +117,7 @@ final class DiskWatcher {
 
     private func drop(_ bsd: String) {
         guard disks.removeValue(forKey: bsd) != nil else { return }
+        attachments += 1
         if disks.isEmpty { allGone = true }
         onChange?()
     }

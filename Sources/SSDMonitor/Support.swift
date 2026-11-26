@@ -68,3 +68,29 @@ enum Log {
 func formatGB(_ bytes: UInt64) -> String {
     String(format: "%.0f GB", Double(bytes) / 1_000_000_000)
 }
+
+/// A temp file that is unlinked as soon as it is made: a child process writes into it through `handle`, the app
+/// reads it back afterwards, and nothing is left on disk whatever happens to the app.
+final class ScratchOutput: @unchecked Sendable {   // an immutable handle, read with pread
+    let handle: FileHandle
+
+    init?() {
+        let path = NSTemporaryDirectory() + "ssd-monitor-\(UUID().uuidString)"
+        let fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { return nil }
+        unlink(path)
+        handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    var size: Int { max(0, Int(lseek(handle.fileDescriptor, 0, SEEK_END))) }
+
+    /// The text written from `offset` on (at most its last `limit` bytes).
+    func text(from offset: Int = 0, limit: Int = 65536) -> String {
+        let size = self.size
+        let start = max(offset, size - limit)
+        guard size > start else { return "" }
+        var bytes = [UInt8](repeating: 0, count: size - start)
+        let got = bytes.withUnsafeMutableBytes { pread(handle.fileDescriptor, $0.baseAddress, $0.count, off_t(start)) }
+        return got > 0 ? String(decoding: bytes.prefix(got), as: UTF8.self) : ""
+    }
+}

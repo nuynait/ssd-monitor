@@ -40,7 +40,9 @@ final class Overlay {
     private var targets: [ButtonTarget] = []
     private var onClick: (() -> Void)?
     private var screenObserver: NSObjectProtocol?
-    private var hiddenForPassword = false
+    /// Who asked it to step aside for a password dialog ("job", "resume", "admin"). Kept when the screen is
+    /// replaced, so a new screen doesn't come up over a dialog that is still open.
+    private var hiddenFor = Set<String>()
     private var shownTitle = ""
 
     var isShown: Bool { window != nil }
@@ -54,7 +56,7 @@ final class Overlay {
         self.window = window
         onClick = content.onClick
         window.contentView = makeContent(content, frame: window.frame)
-        if !window.isVisible, !hiddenForPassword { window.orderFrontRegardless() }
+        if !window.isVisible, hiddenFor.isEmpty { window.orderFrontRegardless() }
     }
 
     /// Update only the bar and its label (no rebuild) while a step runs.
@@ -63,22 +65,21 @@ final class Overlay {
         progressText?.stringValue = label
     }
 
-    /// Get out of the way of a macOS password dialog; `unhide()` brings it back. Updates in between
-    /// don't bring it forward.
-    func hide() {
-        hiddenForPassword = true
+    /// Get out of the way of a macOS password dialog; `unhide(for:)` with the same reason brings it back once no
+    /// one else still wants it out of the way. Updates in between don't bring it forward.
+    func hide(for reason: String) {
+        hiddenFor.insert(reason)
         window?.orderOut(nil)
     }
 
-    func unhide() {
-        hiddenForPassword = false
-        window?.orderFrontRegardless()
+    func unhide(for reason: String) {
+        hiddenFor.remove(reason)
+        if hiddenFor.isEmpty { window?.orderFrontRegardless() }
     }
 
     func close() {
         if window != nil { Log.write("screen closed: \(shownTitle)") }
         shownTitle = ""
-        hiddenForPassword = false
         window?.orderOut(nil)
         window?.contentView = nil
         window = nil
