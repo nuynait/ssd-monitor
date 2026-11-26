@@ -6,6 +6,7 @@ enum Preferences {
     private static let loginSetUpKey = "loginItemSetUp"
     private static let requireKey = "requireSSDSnoozedUntil"
     private static let welcomeKey = "welcomeAnswered"
+    private static let attachmentKey = "ssdAttachment"
     static let defaultSound = "Sosumi"
 
     /// "Require the SSD" (on by default): nil = on; a date = snoozed until then, `.distantFuture` = off until
@@ -19,6 +20,29 @@ enum Preferences {
     }
 
     static var requireSSD: Bool { requireSnoozedUntil.map { $0 <= Date() } ?? true }
+
+    /// When SSD Monitor saw the SSD plugged in, for that one attachment (this boot's session ID and the disk's
+    /// registry entry ID identify it): so the time survives the app restarting while the SSD stays plugged in.
+    static func saveAttachment(id: UInt64, at date: Date) {
+        UserDefaults.standard.set("\(bootSession)|\(id)|\(date.timeIntervalSince1970)", forKey: attachmentKey)
+    }
+
+    static func attachmentTime(id: UInt64) -> Date? {
+        guard let saved = UserDefaults.standard.string(forKey: attachmentKey) else { return nil }
+        let parts = saved.split(separator: "|")
+        guard parts.count == 3, !bootSession.isEmpty, parts[0] == bootSession, parts[1] == "\(id)",
+              let time = Double(parts[2]) else { return nil }
+        return Date(timeIntervalSince1970: time)
+    }
+
+    /// This boot's session ID (kern.bootsessionuuid): unlike the boot time, setting the clock doesn't change it.
+    private static var bootSession: String {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var bytes = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &bytes, &size, nil, 0) == 0 else { return "" }
+        return String(cString: bytes)
+    }
 
     /// The welcome screen (set up the sudo rule) was answered: set up, "Not now", or closed. It is shown once.
     static var welcomeAnswered: Bool {

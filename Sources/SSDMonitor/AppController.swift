@@ -81,6 +81,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
     private var quitting = false
+    /// The current attachment of the SSD (its disk driver's registry entry ID) and when it was plugged in, or nil
+    /// if that was before the app saw it.
+    private(set) var ssdAttachment: (id: UInt64?, at: Date?)?
+    private var attachmentGeneration = 0    // the watcher's attachment count when it was noted
+    private var attachmentChecked = false   // the first look since the app started has been taken
+    private var firstLookAbsent = false     // the first look found no SSD (maybe only not listed yet)
+    private var sawSSDAbsent = false        // an absence for sure: a later attachment is one the app saw happen
+    let startedAt = Date()
     /// What fs_usage last showed about the rule in this run of the app: true = sudo ran it, false = sudo
     /// wanted a password although the file is there; nil = not tried since the file last changed.
     private(set) var sudoRuleWorks: Bool?
@@ -259,6 +267,59 @@ final class AppController: NSObject, NSApplicationDelegate {
         configError = message
         Log.write(message)
         statusMenu?.refresh()
+    }
+
+    /// Keeps when the SSD was plugged in (for Statistics' "since plugged in"). Only on a change between attached
+    /// and not: one registry lookup per plug-in.
+    private func noteAttachment(connected: Bool, replugged: Bool) {
+        let first = !attachmentChecked
+        attachmentChecked = true
+        let starting = AppController.uptime - launchedAt < AppController.startupGrace
+        // Gone and back between two looks (the watcher latched it): a sure absence, and a new attachment.
+        if replugged {
+            sawSSDAbsent = true
+            if connected { ssdAttachment = nil }
+        }
+        guard connected else {
+            // An absence while the app is still starting may only mean DiskArbitration hasn't listed the SSD yet.
+            if first { firstLookAbsent = true } else if !starting || replugged { sawSSDAbsent = true }
+            ssdAttachment = nil
+            return
+        }
+        guard ssdAttachment == nil else { return }
+        // Seen arriving: after a sure absence, or after an absent first look once the start-up time had passed
+        // when DiskArbitration listed it (not when this look happened).
+        let arrival = watcher?.arrivedAt
+        let listedWhileStarting = arrival.map { $0.uptime - launchedAt < AppController.startupGrace } ?? starting
+        let arrived = sawSSDAbsent || (firstLookAbsent && !listedWhileStarting)
+        attachmentGeneration = watcher?.connections ?? 0
+        let id = ssdDevices().volumes.first.flatMap { DiskCounters.diskEntryID(volumeBSD: $0.bsd) }
+        ssdAttachment = (id, arrived ? arrival?.wall ?? Date() : nil)
+        resolveAttachment()
+    }
+
+    /// With the disk's ID known: a time saved for this very attachment (an earlier run of the app saw it arrive)
+    /// wins, and a time seen now is saved. Never replaces a saved one.
+    private func resolveAttachment() {
+        guard let attachment = ssdAttachment, let id = attachment.id else { return }
+        if let saved = Preferences.attachmentTime(id: id) {
+            ssdAttachment = (id, saved)
+        } else if let at = attachment.at {
+            Preferences.saveAttachment(id: id, at: at)
+        }
+    }
+
+    /// The attachment as Statistics needs it. If the disk's ID couldn't be read when it arrived, it is looked up
+    /// again now, but only while it is still the same plug-in (the watcher's connection count hasn't moved).
+    func currentAttachment() -> (id: UInt64?, at: Date?)? {
+        guard let attachment = ssdAttachment, attachment.id == nil,
+              watcher?.connections == attachmentGeneration else { return ssdAttachment?.id == nil ? nil : ssdAttachment }
+        guard let id = ssdDevices().volumes.first.flatMap({ DiskCounters.diskEntryID(volumeBSD: $0.bsd) }) else {
+            return nil
+        }
+        ssdAttachment = (id, attachment.at)
+        resolveAttachment()
+        return ssdAttachment
     }
 
     // MARK: - statistics, settings, the sudo rule
@@ -444,6 +505,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // app was not running. That return is owed its resume too.
         if h.connected, !seenConnected, markerSaysEjected() { wasDisconnected = true }
         if h.connected { seenConnected = true; plannedAway = false }
+        noteAttachment(connected: h.connected, replugged: lostAll)
 
         switch phase {
         case .resuming:

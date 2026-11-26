@@ -18,6 +18,8 @@ final class DiskCounters {
     /// fs_usage names one of these (or a partition) for I/O that no volume owns.
     private(set) var wholeDisk: String?
     private(set) var container: String?
+    /// The disk driver's registry entry ID: the same for as long as this attachment lasts, new after a replug.
+    private(set) var diskEntryID: UInt64?
 
     /// `devices`: the setup's volumes that are attached, with their BSD names ("disk5s1").
     init(devices: [(name: String, bsd: String)]) {
@@ -32,6 +34,11 @@ final class DiskCounters {
     deinit {
         for volume in volumes { IOObjectRelease(volume.entry) }
         if driver != 0 { IOObjectRelease(driver) }
+    }
+
+    /// The registry entry ID of the disk a volume is on (see `diskEntryID`).
+    static func diskEntryID(volumeBSD: String) -> UInt64? {
+        DiskCounters(devices: [("", volumeBSD)]).diskEntryID
     }
 
     func read() -> Reading {
@@ -62,6 +69,8 @@ final class DiskCounters {
             if IOObjectConformsTo(parent, "IOBlockStorageDriver") != 0 {
                 driver = parent   // kept until deinit
                 wholeDisk = lastMedia
+                var id: UInt64 = 0
+                if IORegistryEntryGetRegistryEntryID(parent, &id) == KERN_SUCCESS { diskEntryID = id }
                 return
             }
             if IOObjectConformsTo(parent, "IOMedia") != 0, let bsd = DiskCounters.property(parent, "BSD Name") as? String {

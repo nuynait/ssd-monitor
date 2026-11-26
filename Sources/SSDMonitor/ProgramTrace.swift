@@ -28,6 +28,7 @@ final class ProgramTrace: @unchecked Sendable {
     struct Batch {
         let generation: Int
         let second: Int          // `clock`, whole seconds, when the lines came in
+        let at: TimeInterval     // `clock`, exactly
         var bytes: [Key: (read: UInt64, written: UInt64)]
     }
     /// Where the SSD is now: its volumes' devices and mount paths, the whole disk and the APFS container.
@@ -59,9 +60,15 @@ final class ProgramTrace: @unchecked Sendable {
     }
 
     /// Called on the main thread, never after `stop()`. `onLaunch`: each time an fs_usage run starts.
-    var onBatch: (@MainActor (Batch) -> Void)?
+    /// `current`: parsed under the current device map (only those count for the live rates).
+    var onBatch: (@MainActor (Batch, _ current: Bool) -> Void)?
     var onState: (@MainActor (State) -> Void)?
     var onLaunch: (@MainActor () -> Void)?
+    /// fs_usage reported dropped events (also after `stop()`, for the runs still finishing).
+    var onDropped: (@MainActor () -> Void)?
+    /// Its first record (any disk) came in, at this `clock` time: tracing surely ran from then (also after
+    /// `stop()`).
+    var onCoverage: (@MainActor (TimeInterval) -> Void)?
     @MainActor private(set) var state = State.starting
     /// sudo's own words when it refused to run fs_usage (state .needsSetup), for the setup and Settings to show.
     @MainActor private(set) var refusal: String?
@@ -120,8 +127,7 @@ final class ProgramTrace: @unchecked Sendable {
     func stop() {
         guard !stopped else { return }
         stopped = true
-        onBatch = nil
-        onState = nil
+        onState = nil   // onBatch stays: batches already parsed still reach the history (not the live rates)
         onLaunch = nil
         ProgramTrace.waiting.removeAll { $0 === self }
         queue.async { self.closeReader() }                 // its output is no longer wanted
@@ -211,6 +217,9 @@ final class ProgramTrace: @unchecked Sendable {
     }
 
     /// How much of [from, to) fs_usage was running for (its runs restart every 30 s, with a short gap).
+    /// When the first run began tracing (its first record, else its launch), by `clock`.
+    @MainActor var firstCoverage: TimeInterval? { runs.first.map { $0.traced ?? $0.start } }
+
     @MainActor
     func watched(from: TimeInterval, to: TimeInterval) -> TimeInterval {
         var total: TimeInterval = 0
@@ -271,6 +280,7 @@ final class ProgramTrace: @unchecked Sendable {
         if new.contains("buffer overrun") {
             if droppedAt == nil { Log.write("program list: fs_usage dropped events (busy Mac)") }
             droppedAt = ProgramTrace.clock
+            onDropped?()
         }
     }
 
@@ -297,8 +307,7 @@ final class ProgramTrace: @unchecked Sendable {
         lock.lock()
         let current = generation
         lock.unlock()
-        guard !stopped, batch.generation == current else { return }
-        onBatch?(batch)
+        onBatch?(batch, !stopped && batch.generation == current)
     }
 
     /// On the queue: read the pseudo-terminal until fs_usage has gone (EOF, or EIO once nothing holds the
@@ -356,7 +365,8 @@ final class ProgramTrace: @unchecked Sendable {
         let devices = self.devices
         let generation = self.generation
         lock.unlock()
-        var batch = Batch(generation: generation, second: Int(ProgramTrace.clock), bytes: [:])
+        let now = ProgramTrace.clock
+        var batch = Batch(generation: generation, second: Int(now), at: now, bytes: [:])
         var lineStart = 0
         for i in 0..<pending.count where pending[i] == 10 {
             // The first complete disk I/O record (any disk) proves sudo ran fs_usage and the kernel trace runs;
@@ -369,6 +379,7 @@ final class ProgramTrace: @unchecked Sendable {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         if let last = self.runs.indices.last, self.runs[last].traced == nil { self.runs[last].traced = at }
+                        if first { self.onCoverage?(at) }
                         guard first, !self.stopped, self.state == .starting else { return }
                         self.everRan = true
                         self.report(.running)

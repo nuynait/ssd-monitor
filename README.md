@@ -167,7 +167,9 @@ The SSD's free space, each folder's state, and a few actions.
 
 **Open Statistics…** in the menu shows how fast the SSD reads and writes: right now, and as a graph of the last
 10 minutes. Hover over the graph to see any second. Tick or untick volumes to look at just the ones you care
-about, and see which programs are reading and writing them.
+about, and see which programs are reading and writing them right now, and how much each has read and written
+since you opened the window, per volume. It also shows the highest speeds since you opened it, and how much
+has been read and written since the SSD was plugged in.
 
 It only runs while the window is open, and starts fresh each time you open it.
 

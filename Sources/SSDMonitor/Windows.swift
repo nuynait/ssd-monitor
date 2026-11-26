@@ -111,3 +111,15 @@ func formatRate(_ bytesPerSecond: Double) -> String {
     default: return String(format: "%.2f GB/s", v / 1_000_000_000)
     }
 }
+
+/// Amounts as Finder counts bytes (1 GB = 1,000,000,000 bytes).
+func formatBytes(_ bytes: UInt64) -> String {
+    let v = Double(bytes)
+    switch v {
+    case ..<1_000: return "\(bytes) B"
+    case ..<1_000_000: return String(format: "%.0f KB", v / 1_000)
+    case ..<1_000_000_000: return String(format: "%.0f MB", v / 1_000_000)
+    case ..<1_000_000_000_000: return String(format: "%.1f GB", v / 1_000_000_000)
+    default: return String(format: "%.2f TB", v / 1_000_000_000_000)
+    }
+}

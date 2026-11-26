@@ -505,6 +505,28 @@ normal quit. Each command's temp files live in a folder of its own, removed when
   rows.
 - the programs reading and writing the checked volumes, averaged over the last 3 whole seconds, busiest first,
   all of them (the lists scroll).
+- since the window opened (user decisions, 2026-11-26; nothing is kept after it closes): the highest read and
+  write speed for the whole SSD, with the time of each, and per volume (Max read, Max write columns); and every
+  program's reads and writes, grouped by program (its totals, then one line per volume it used), busiest first,
+  following the checkboxes. Its title says since when it counts (when tracing really began, if later than the
+  window), and an orange note lists known gaps (the program list stopped for a while, fs_usage dropped events).
+  It is redrawn only when it changed, and shows at most 300 lines: the busiest programs in order until one
+  doesn't fit, then "N more programs, with less traffic, not shown" (per-volume lines are made only for the
+  programs shown), so a window left open while thousands of differently named programs ran stays light. A
+  replaced trace's last data, its start and its dropped-event reports still reach the history. Only the top 150
+  programs are kept in order (totals only grow, so one outside can only come in); unchecked volumes' traffic is
+  kept but doesn't redraw it. Its start is compared on the monotonic clock. Out of scope (rare races): macOS
+  reusing a disk name in the moment a trace is retired, and a failed registry lookup at arrival followed by a
+  replug before Statistics reads it.
+- "Since plugged in at <time>: <read>, <written>": the whole disk's own counters, which start when the SSD is
+  attached. macOS doesn't record when that was, so AppController notes it when it sees the SSD arrive (one
+  registry lookup per plug-in, in `evaluate`; retried when Statistics asks if it failed) and saves it with the
+  attachment's identity (this boot's `kern.bootsessionuuid` and the disk driver's registry entry ID), so an app
+  restart keeps it and never overwrites it. A gone-and-back between two looks counts as a new attachment. An
+  absence seen during the app's first 20 s doesn't count (DiskArbitration may not have listed the SSD yet), so an
+  SSD that turns up then counts as already there; the arrival's time is when DiskWatcher listed it. An attachment the app never saw arrive says "before SSD Monitor
+  started"; the time shows only when its ID matches the counters being shown, and a late ID lookup is used only
+  within the same attachment.
 - the lists scroll if the window is too short for them; the graph keeps at least 150 points.
 
 **Nothing of it runs while the window is closed** (user rule). Opening it starts a 1-second timer and the program

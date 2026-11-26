@@ -24,6 +24,10 @@ final class DiskWatcher {
     /// Counts the SSD's disks appearing and disappearing: a change means a new attachment (new byte counters),
     /// even if the disks came back under the same names.
     private(set) var attachments = 0
+    /// Counts the SSD arriving (from none of its disks listed to some): one per physical plug-in.
+    private(set) var connections = 0
+    /// When it last arrived: system uptime (for a grace period) and the wall clock (to show).
+    private(set) var arrivedAt: (uptime: TimeInterval, wall: Date)?
     var onChange: (() -> Void)?
 
     init(uuids: Set<String>) {
@@ -106,7 +110,13 @@ final class DiskWatcher {
         let new = Disk(bsdName: bsd, uuid: uuid, volumePath: path)
         let old = disks[bsd]
         disks[bsd] = new
-        if old == nil { attachments += 1 }
+        if old == nil {
+            if disks.count == 1 {   // the first of its disks: the SSD itself arrived
+                connections += 1
+                arrivedAt = (ProcessInfo.processInfo.systemUptime, Date())
+            }
+            attachments += 1
+        }
         if old?.volumePath != new.volumePath || old == nil { onChange?() }
     }
 

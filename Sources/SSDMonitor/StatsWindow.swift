@@ -65,7 +65,34 @@ final class StatsWindow: NSObject, NSWindowDelegate {
     private let readValue = UI.number(size: 24, weight: .medium)
     private let writeValue = UI.number(size: 24, weight: .medium)
     private let graph = GraphView()
-    private var volumeCells: [(check: NSButton, read: NSTextField, write: NSTextField)] = []
+    private var volumeCells: [(check: NSButton, read: NSTextField, write: NSTextField,
+                               maxRead: NSTextField, maxWrite: NSTextField)] = []
+    // Since the window opened (user decision: nothing kept after it closes).
+    private var rowMax: [(read: Double, write: Double)]
+    private var totalMax: (read: Double, readAt: Date?, write: Double, writeAt: Date?) = (0, nil, 0, nil)
+    private var history: [String: [Int: (read: UInt64, written: UInt64)]] = [:]   // program -> row -> bytes
+    private var historySince: (clock: TimeInterval, wall: Date)?   // when the program list first traced
+    private var historyGaps: [String] = []    // why some traffic may be missing from the history
+    private var historyDirty = true           // the history or the checkboxes changed since it was shown
+    private var rankTotals: [String: UInt64] = [:]   // each program's bytes on the checked rows
+    private var rankOrder: [String] = []      // programs, busiest first
+    private var rankChanged = Set<String>()   // programs whose total changed since the ranking was updated
+    private var rankRebuild = true            // the checkboxes changed: rank everything again
+    private var stoppedBeforeHistory = false  // a trace stopped before the history's first data arrived
+    private var openedAt = Date()
+    private var lastDisk: DiskCounters.Bytes?   // the whole disk's counters: since it was plugged in
+    private let maxReadLabel = UI.label(size: NSFont.smallSystemFontSize, color: .secondaryLabelColor)
+    private let maxWriteLabel = UI.label(size: NSFont.smallSystemFontSize, color: .secondaryLabelColor)
+    private let totalsLabel = UI.label(size: NSFont.smallSystemFontSize, color: .secondaryLabelColor)
+    private var historyCells: [(name: NSTextField, volume: NSTextField, read: NSTextField, write: NSTextField)] = []
+    private var historyGrid: NSGridView?
+    private let historyNote = UI.label(color: .secondaryLabelColor)
+    private let historyTitle = UI.label("Programs since the window opened", weight: .semibold)
+    private let historyGapNote = UI.label(size: NSFont.smallSystemFontSize, color: .systemOrange, wraps: true)
+    private let historyMore = UI.label(size: NSFont.smallSystemFontSize, color: .secondaryLabelColor)
+    static let historyLines = 300
+    static let rankedPrograms = 150   // at least two lines each: all that 300 lines can show
+    private var openedAtClock: TimeInterval?
     private var programCells: [(name: NSTextField, read: NSTextField, write: NSTextField)] = []
     private var programGrid: NSGridView?
     private let programNote = UI.label(color: .secondaryLabelColor, wraps: true)
@@ -83,6 +110,7 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         self.volumes = volumes
         rowNames = volumes.map(\.name) + [StatsWindow.sharedName]
         checked = Array(repeating: true, count: rowNames.count)
+        rowMax = Array(repeating: (0, 0), count: rowNames.count)
         super.init()
     }
 
@@ -149,6 +177,8 @@ final class StatsWindow: NSObject, NSWindowDelegate {
 
     private func start() {
         Log.write("statistics: opened")
+        openedAt = Date()
+        openedAtClock = StatsWindow.uptime
         tick()   // the first reading is only the starting point; the first speed comes a second later
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -166,6 +196,7 @@ final class StatsWindow: NSObject, NSWindowDelegate {
                                  now: TimeInterval) {
         let first = deviceKey == nil
         deviceKey = key
+        lastDisk = nil   // the totals belong to the attachment that is gone
         self.devices = devices
         countersIncomplete = false
         attached = Set(devices.map(\.name))
@@ -173,8 +204,12 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         liveSince = now
         programsSince = now
         counters = devices.isEmpty ? nil : DiskCounters(devices: devices.map { ($0.name, $0.bsd) })
+        // The old trace stops with its own map (what it still has to deliver was read on the old devices); the new
+        // map goes to its replacement.
+        let restart = !first && trace != nil
+        if restart { stopTrace() }
         tellTrace(devices)
-        if !first, trace != nil { startTrace() }
+        if restart { startTrace() }
     }
 
     /// Which devices and mount points belong to which volume, for the program list. A volume mounted somewhere
@@ -227,8 +262,12 @@ final class StatsWindow: NSObject, NSWindowDelegate {
             baseline = nil
             tellTrace(devices)   // the whole disk and container may only be known now
         }
-        guard let counters else { return }
+        guard let counters else {
+            lastDisk = nil
+            return
+        }
         let reading = counters.read()
+        lastDisk = reading.disk
         guard let base = baseline, now - base.time <= StatsWindow.longestInterval else {
             // The first reading, or the first after a sleep: a starting point, no bar. Nothing from before the
             // sleep counts as current, and the program list starts over too.
@@ -286,7 +325,17 @@ final class StatsWindow: NSObject, NSWindowDelegate {
                 }
             }
         }
-        samples.append(Sample(time: now, seconds: elapsed, wall: Date(), read: read, write: write))
+        let sample = Sample(time: now, seconds: elapsed, wall: Date(), read: read, write: write)
+        samples.append(sample)
+        // The highest so far, per row and for the whole SSD (every row, whatever is checked).
+        for row in rowNames.indices {
+            rowMax[row].read = max(rowMax[row].read, read[row])
+            rowMax[row].write = max(rowMax[row].write, write[row])
+        }
+        let everything = Array(repeating: true, count: rowNames.count)
+        let total = (read: sample.total(everything, read: true), write: sample.total(everything, read: false))
+        if total.read > totalMax.read { totalMax.read = total.read; totalMax.readAt = sample.wall }
+        if total.write > totalMax.write { totalMax.write = total.write; totalMax.writeAt = sample.wall }
         let oldest = now - StatsWindow.span - 2
         if let keep = samples.firstIndex(where: { $0.time >= oldest }), keep > 0 { samples.removeFirst(keep) }
     }
@@ -311,11 +360,20 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         let trace = ProgramTrace()
         ruleSignature = SudoRule.signature()
         trace.setDevices(traceDevices)
-        trace.onBatch = { [weak self] batch in self?.add(batch) }
+        trace.onBatch = { [weak self] batch, current in self?.add(batch, current: current) }
+        trace.onDropped = { [weak self] in self?.noteHistoryGap("fs_usage dropped events while the Mac was busy") }
+        trace.onCoverage = { [weak self] at in self?.coverage(from: at) }
         trace.onState = { [weak self] state in
             guard let self else { return }
             self.traceState = state
-            if state == .running { self.controller.sudoRuleTried(works: true) }
+            if state == .running {
+                self.controller.sudoRuleTried(works: true)
+                self.coverage(from: trace.firstCoverage ?? StatsWindow.uptime)   // a quiet run's launch at worst
+            }
+            if self.historySince != nil, state == .needsSetup || { if case .failed = state { return true }; return false }() {
+                self.noteHistoryGap("the program list stopped for a while")
+            }
+            self.historyDirty = true
             if state == .needsSetup, SudoRule.isInstalled {
                 self.controller.sudoRuleTried(works: false, refusal: trace.refusal)
             }
@@ -327,13 +385,43 @@ final class StatsWindow: NSObject, NSWindowDelegate {
     }
 
     private func stopTrace() {
+        if let trace {
+            // The history has a hole from here until a new trace runs: say so, with any drops it reported.
+            trace.checkDropped()
+            if let dropped = trace.droppedAt, dropped > (openedAtClock ?? 0) {
+                noteHistoryGap("fs_usage dropped events while the Mac was busy")
+            }
+            if !closed {
+                if historySince != nil { noteHistoryGap("the program list stopped for a while") }
+                else if trace.launchedAt != nil { stoppedBeforeHistory = true }   // reported once data turns up
+            }
+        }
         trace?.stop()
         trace = nil
         buckets = []
     }
 
-    private func add(_ batch: ProgramTrace.Batch) {
+    private func add(_ batch: ProgramTrace.Batch, current: Bool) {
+        guard !closed else { return }
         let shared = rowNames.count - 1
+        // Data counts from when it came in, even if the "running" news of its trace never arrived (stopped first).
+        coverage(from: batch.at)
+        // The history takes every batch (its volumes were told apart when it was parsed); the live rates only
+        // those parsed under the current device map.
+        for (key, bytes) in batch.bytes {
+            let row = key.volume.flatMap { rowNames.firstIndex(of: $0) } ?? shared
+            var since = history[key.program, default: [:]][row] ?? (0, 0)
+            since.read = since.read.addingSaturated(bytes.read)
+            since.written = since.written.addingSaturated(bytes.written)
+            history[key.program, default: [:]][row] = since
+            if checked[row] {   // unchecked rows are kept, but don't change what is shown
+                rankTotals[key.program, default: 0] = rankTotals[key.program, default: 0]
+                    .addingSaturated(bytes.read).addingSaturated(bytes.written)
+                rankChanged.insert(key.program)
+                historyDirty = true
+            }
+        }
+        guard current else { return }
         var index = buckets.lastIndex { $0.second == batch.second }
         if index == nil {
             buckets.append((batch.second, [:]))
@@ -415,8 +503,18 @@ final class StatsWindow: NSObject, NSWindowDelegate {
                 cells.read.stringValue = present && connected ? "…" : "–"
                 cells.write.stringValue = present && connected ? "…" : "–"
             }
+            cells.maxRead.stringValue = rowMax[row].read > 0 ? formatRate(rowMax[row].read) : "–"
+            cells.maxWrite.stringValue = rowMax[row].write > 0 ? formatRate(rowMax[row].write) : "–"
         }
+        func high(_ value: Double, _ at: Date?) -> String {
+            guard let at, value > 0 else { return "–" }
+            return "\(formatRate(value)) at \(at.formatted(date: .omitted, time: .standard))"
+        }
+        maxReadLabel.stringValue = "Highest read since opened: " + high(totalMax.read, totalMax.readAt)
+        maxWriteLabel.stringValue = "Highest write since opened: " + high(totalMax.write, totalMax.writeAt)
+        totalsLabel.stringValue = totalsText()
         renderPrograms(now: now)
+        renderHistory()
     }
 
     private func renderPrograms(now: TimeInterval) {
@@ -455,7 +553,7 @@ final class StatsWindow: NSObject, NSWindowDelegate {
             // and programs whose names start alike are counted together.
             let cut = rows[i].name.utf8.count >= 16   // 16 bytes, not characters
             cells.name.stringValue = rows[i].name + (cut ? "…" : "")
-            cells.name.toolTip = cut ? "macOS keeps only the first 16 characters of a program's name, so programs whose names start alike are counted together." : nil
+            cells.name.toolTip = rows[i].name + (cut ? "\nmacOS keeps only the first 16 characters of a program's name, so programs whose names start alike are counted together." : "")
             cells.read.stringValue = rows[i].read > 0 ? formatRate(rows[i].read) : "–"
             cells.write.stringValue = rows[i].write > 0 ? formatRate(rows[i].write) : "–"
         }
@@ -466,11 +564,163 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         spinning ? programSpinner.startAnimation(nil) : programSpinner.stopAnimation(nil)
     }
 
+    /// "Since plugged in at 9:12: 1.20 TB read, 380 GB written": the whole disk's own counters, which start when
+    /// the SSD is attached. When it was attached is known if the app saw it happen (AppController).
+    private func totalsText() -> String {
+        guard let disk = lastDisk else { return counters == nil ? "SSD not connected" : "" }
+        let amounts = "\(formatBytes(disk.read)) read, \(formatBytes(disk.written)) written"
+        guard let attachment = controller.currentAttachment(), let id = attachment.id, id == counters?.diskEntryID else {
+            return "Since plugged in: \(amounts)"   // the app hasn't looked at this attachment yet
+        }
+        guard let at = attachment.at else {
+            return "Since plugged in (before SSD Monitor started, \(StatsWindow.when(controller.startedAt))): \(amounts)"
+        }
+        return "Since plugged in at \(StatsWindow.when(at)): \(amounts)"
+    }
+
+    private static func when(_ date: Date) -> String {
+        Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened)
+            : date.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    /// Every program since the window opened, busiest first: its totals on the checked rows, then one line per
+    /// row (volume) it used.
+    /// Tracing ran from `clock` time `at`: the history counts from the earliest such moment (compared on the
+    /// monotonic clock; the wall time is kept for showing).
+    private func coverage(from at: TimeInterval) {
+        guard !closed, historySince.map({ at < $0.clock }) ?? true else { return }
+        if historySince == nil, stoppedBeforeHistory { noteHistoryGap("the program list stopped for a while") }
+        historySince = (at, Date(timeIntervalSinceNow: at - StatsWindow.uptime))
+    }
+
+    private func noteHistoryGap(_ why: String) {
+        guard !historyGaps.contains(why) else { return }
+        historyGaps.append(why)
+        historyDirty = true
+    }
+
+    private func renderHistory() {
+        guard let historyGrid else { return }
+        if let dropped = trace?.droppedAt, dropped > (openedAtClock ?? 0) { noteHistoryGap("fs_usage dropped events while the Mac was busy") }
+        historyTitle.stringValue = historySince.map { since in
+            since.clock - (openedAtClock ?? since.clock) > 1
+                ? "Programs since \(since.wall.formatted(date: .omitted, time: .standard)) (when the program list started)"
+                : "Programs since the window opened"
+        } ?? "Programs since the window opened"
+        historyGapNote.stringValue = historyGaps.isEmpty ? "" : "Some reads and writes may be missing: " + historyGaps.joined(separator: "; ") + "."
+        historyGapNote.isHidden = historyGaps.isEmpty
+        historyNote.stringValue = historySince == nil ? "Shows once the program list runs."
+            : "No program has read or written the checked volumes since then."
+        guard historyDirty else { return }   // nothing new: no sorting, no redrawing
+        historyDirty = false
+        var lines: [(name: String, volume: String, read: UInt64, written: UInt64, total: Bool)] = []
+        updateRanking()
+        // Per-volume lines are made only for the programs shown.
+        var programs: [(name: String, read: UInt64, written: UInt64)] = []
+        for program in rankOrder {
+            var read: UInt64 = 0
+            var written: UInt64 = 0
+            for (row, bytes) in history[program] ?? [:] where checked[row] {
+                read = read.addingSaturated(bytes.read)
+                written = written.addingSaturated(bytes.written)
+            }
+            programs.append((program, read, written))
+            if programs.count > StatsWindow.historyLines { break }   // enough to fill the lines
+        }
+        // At most this many lines, so a window left open while thousands of differently named programs touch the
+        // SSD stays light: the busiest programs, in order, until one doesn't fit; the rest are counted.
+        var shown = 0
+        for program in programs {
+            let rows = (history[program.name] ?? [:])
+                .filter { checked[$0.key] && $0.value.read.addingSaturated($0.value.written) > 0 }
+                .sorted { $0.value.read.addingSaturated($0.value.written) > $1.value.read.addingSaturated($1.value.written) }
+            guard lines.count + 1 + rows.count <= StatsWindow.historyLines else { break }
+            shown += 1
+            lines.append((program.name, "", program.read, program.written, true))
+            for (row, bytes) in rows { lines.append(("", rowNames[row], bytes.read, bytes.written, false)) }
+        }
+        let hidden = rankTotals.count - shown   // every program with traffic on the checked rows, minus those shown
+        historyMore.stringValue = hidden > 0 ? "\(hidden) more program\(hidden == 1 ? "" : "s"), with less traffic, not shown." : ""
+        historyMore.isHidden = hidden == 0
+        while historyCells.count < lines.count { addHistoryRow(to: historyGrid) }
+        for (i, cells) in historyCells.enumerated() {
+            let used = i < lines.count
+            historyGrid.row(at: i + 1).isHidden = !used
+            guard used else { continue }
+            let line = lines[i]
+            let cut = line.total && line.name.utf8.count >= 16
+            StatsWindow.set(cells.name, line.name + (cut ? "…" : ""))
+            cells.name.toolTip = line.name.isEmpty ? nil : line.name
+            cells.volume.toolTip = line.volume.isEmpty ? nil : line.volume
+            let font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: line.total ? .semibold : .regular)
+            if cells.name.font != font { cells.name.font = font }
+            StatsWindow.set(cells.volume, line.volume)
+            StatsWindow.set(cells.read, line.read > 0 ? formatBytes(line.read) : "–")
+            StatsWindow.set(cells.write, line.written > 0 ? formatBytes(line.written) : "–")
+        }
+        historyGrid.isHidden = lines.isEmpty
+        historyNote.isHidden = !lines.isEmpty
+    }
+
+    /// Only a changed text is set (so an unchanged row costs nothing).
+    private static func set(_ field: NSTextField, _ text: String) {
+        if field.stringValue != text { field.stringValue = text }
+    }
+
+    /// Busiest first. Only the programs whose totals changed move (a binary search for their new place); a
+    /// checkbox change ranks everything again.
+    private func updateRanking() {
+        if rankRebuild {
+            rankRebuild = false
+            rankChanged = []
+            rankTotals = [:]
+            for (program, byRow) in history {
+                var total: UInt64 = 0
+                for (row, bytes) in byRow where checked[row] { total = total.addingSaturated(bytes.read).addingSaturated(bytes.written) }
+                if total > 0 { rankTotals[program] = total }
+            }
+            rankOrder = Array(rankTotals.keys.sorted { (rankTotals[$0] ?? 0, $1) > (rankTotals[$1] ?? 0, $0) }
+                .prefix(StatsWindow.rankedPrograms))
+            return
+        }
+        guard !rankChanged.isEmpty else { return }
+        // Only the top programs are kept in order (all that 300 lines can show); totals only grow, so a program
+        // outside can only come in, pushing the last one out.
+        rankOrder.removeAll { rankChanged.contains($0) }
+        for program in rankChanged {
+            let total = rankTotals[program] ?? 0
+            guard total > 0 else { continue }
+            var low = 0
+            var high = rankOrder.count
+            while low < high {
+                let mid = (low + high) / 2
+                if (rankTotals[rankOrder[mid]] ?? 0, program) > (total, rankOrder[mid]) { low = mid + 1 } else { high = mid }
+            }
+            if low < StatsWindow.rankedPrograms { rankOrder.insert(program, at: low) }
+        }
+        if rankOrder.count > StatsWindow.rankedPrograms { rankOrder.removeLast(rankOrder.count - StatsWindow.rankedPrograms) }
+        rankChanged = []
+    }
+
+    private func addHistoryRow(to grid: NSGridView) {
+        let name = UI.label()
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let volume = UI.label(color: .secondaryLabelColor)
+        name.setContentCompressionResistancePriority(.init(300), for: .horizontal)
+        volume.setContentCompressionResistancePriority(.init(200), for: .horizontal)   // gives way first
+        let read = UI.number()
+        let write = UI.number()
+        historyCells.append((name, volume, read, write))
+        grid.addRow(with: [name, volume, read, write])
+    }
+
     // MARK: - actions
 
     @objc private func toggleRow(_ sender: NSButton) {
         guard checked.indices.contains(sender.tag) else { return }
         checked[sender.tag] = sender.state == .on
+        historyDirty = true
+        rankRebuild = true
         render(now: StatsWindow.uptime)
     }
 
@@ -481,8 +731,8 @@ final class StatsWindow: NSObject, NSWindowDelegate {
     // MARK: - building
 
     private func build() -> NSWindow {
-        let window = UI.window(title: "SSD Statistics", size: NSSize(width: 800, height: 660), resizable: true, delegate: self)
-        window.contentMinSize = NSSize(width: 720, height: 520)
+        let window = UI.window(title: "SSD Statistics", size: NSSize(width: 960, height: 720), resizable: true, delegate: self)
+        window.contentMinSize = NSSize(width: 860, height: 560)
 
         func headline(_ title: String, _ color: NSColor, _ value: NSTextField) -> NSStackView {
             value.alignment = .left
@@ -490,8 +740,13 @@ final class StatsWindow: NSObject, NSWindowDelegate {
             let name = UI.label(title, color: .secondaryLabelColor)
             return UI.stack([value, UI.stack([dot, name], vertical: false, spacing: 5)], vertical: true, spacing: 2)
         }
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let highs = UI.stack([maxReadLabel, maxWriteLabel], vertical: true, spacing: 4, alignment: .trailing)
         let header = UI.stack([headline("Read", GraphView.readColor, readValue),
-                               headline("Write", GraphView.writeColor, writeValue)], vertical: false, spacing: 48)
+                               headline("Write", GraphView.writeColor, writeValue), headerSpacer, highs],
+                              vertical: false, spacing: 48)
+        header.distribution = .fill   // the spacer takes the extra width: the highs sit at the right edge
 
 
         let axisSpacer = NSView()
@@ -502,28 +757,36 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         let small = NSFont.smallSystemFontSize
         var volumeRows: [[NSView]] = [[UI.label("Volume", size: small, color: .secondaryLabelColor),
                                        UI.label("Read", size: small, color: .secondaryLabelColor),
-                                       UI.label("Write", size: small, color: .secondaryLabelColor)]]
+                                       UI.label("Write", size: small, color: .secondaryLabelColor),
+                                       UI.label("Max read", size: small, color: .secondaryLabelColor),
+                                       UI.label("Max write", size: small, color: .secondaryLabelColor)]]
         for (row, name) in rowNames.enumerated() {
             let check = NSButton(checkboxWithTitle: name, target: self, action: #selector(toggleRow(_:)))
             check.tag = row
             check.state = .on
+            // A long volume name gives way first (cut short, full name in the tooltip), not the program list.
+            check.cell?.lineBreakMode = .byTruncatingTail
+            check.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            check.toolTip = name
             if row == rowNames.count - 1 {
                 check.toolTip = "Reads and writes APFS makes for the SSD as a whole (checkpoints, space maps): they belong to no single volume."
             }
             let read = UI.number()
             let write = UI.number()
-            volumeCells.append((check, read, write))
-            volumeRows.append([check, read, write])
+            let maxRead = UI.number()
+            let maxWrite = UI.number()
+            volumeCells.append((check, read, write, maxRead, maxWrite))
+            volumeRows.append([check, read, write, maxRead, maxWrite])
         }
         let volumeGrid = NSGridView(views: volumeRows)
-        configure(volumeGrid)
+        configure(volumeGrid, numbers: 1...4, width: 76)
 
         // Programs.
         let programRows: [[NSView]] = [[UI.label("Program", size: small, color: .secondaryLabelColor),
                                         UI.label("Read", size: small, color: .secondaryLabelColor),
                                         UI.label("Write", size: small, color: .secondaryLabelColor)]]
         let programGrid = NSGridView(views: programRows)
-        configure(programGrid)
+        configure(programGrid, numbers: 1...2, width: 76)
         for _ in 0..<StatsWindow.programRows { addProgramRow(to: programGrid) }
         self.programGrid = programGrid
         let programButtons = UI.stack([programSpinner, setupButton, retryButton], vertical: false)
@@ -537,8 +800,22 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         let programsColumn = UI.stack([programsTitle, programGrid, programNote, programButtons, filler],
                                       vertical: true, spacing: 8)
         programsColumn.distribution = .fill
-        let bottom = UI.stack([volumesColumn, programsColumn], vertical: false, spacing: 32, alignment: .top)
-        bottom.distribution = .fillEqually
+        programsColumn.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        let lists = UI.stack([volumesColumn, programsColumn], vertical: false, spacing: 32, alignment: .top)
+        lists.distribution = .fill
+        volumesColumn.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        // Every program since the window opened: totals, then each volume it used.
+        let historyRows: [[NSView]] = [[UI.label("Program", size: small, color: .secondaryLabelColor),
+                                        UI.label("Volume", size: small, color: .secondaryLabelColor),
+                                        UI.label("Read", size: small, color: .secondaryLabelColor),
+                                        UI.label("Write", size: small, color: .secondaryLabelColor)]]
+        let historyGrid = NSGridView(views: historyRows)
+        configure(historyGrid, numbers: 2...3, width: 90)
+        self.historyGrid = historyGrid
+        let history = UI.stack([historyTitle, historyGapNote, historyGrid, historyMore, historyNote], vertical: true, spacing: 8)
+        let bottom = UI.stack([lists, history], vertical: true, spacing: 24)
+        lists.widthAnchor.constraint(equalTo: bottom.widthAnchor).isActive = true
 
         // The lists scroll when the window is too short for them (a Mac with many volumes); the graph keeps at
         // least 150 points and takes any height left over.
@@ -552,8 +829,9 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         scroll.documentView = document
         document.translatesAutoresizingMaskIntoConstraints = false
 
-        let column = UI.stack([header, graph, axis, scroll], vertical: true, spacing: 10)
+        let column = UI.stack([header, totalsLabel, graph, axis, scroll], vertical: true, spacing: 10)
         column.distribution = .fill
+        column.setCustomSpacing(6, after: header)
         column.setCustomSpacing(4, after: graph)
         column.setCustomSpacing(20, after: axis)
         column.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 20, right: 20)
@@ -570,6 +848,7 @@ final class StatsWindow: NSObject, NSWindowDelegate {
             column.topAnchor.constraint(equalTo: content.topAnchor),
             column.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             graph.widthAnchor.constraint(equalTo: column.widthAnchor, constant: -inset),
+            header.widthAnchor.constraint(equalTo: column.widthAnchor, constant: -inset),   // highs at the right
             axis.widthAnchor.constraint(equalTo: column.widthAnchor, constant: -inset),
             scroll.widthAnchor.constraint(equalTo: column.widthAnchor, constant: -inset),
             graph.heightAnchor.constraint(greaterThanOrEqualToConstant: 150),
@@ -599,13 +878,13 @@ final class StatsWindow: NSObject, NSWindowDelegate {
         grid.addRow(with: [name, read, write])
     }
 
-    private func configure(_ grid: NSGridView) {
+    private func configure(_ grid: NSGridView, numbers: ClosedRange<Int>, width: CGFloat) {
         grid.rowSpacing = 5
-        grid.columnSpacing = 16
+        grid.columnSpacing = 14
         grid.column(at: 0).xPlacement = .leading
-        for i in 1...2 {
+        for i in numbers {
             grid.column(at: i).xPlacement = .trailing
-            grid.column(at: i).width = 84
+            grid.column(at: i).width = width
         }
     }
 }
